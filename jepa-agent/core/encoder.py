@@ -8,10 +8,11 @@ import torch
 import numpy as np
 from transformers import T5EncoderModel, AutoTokenizer
 
-from config import CODET5_MODEL, MAX_CODE_TOKENS, EMBEDDING_DIM
+from .config import CODET5_MODEL, MAX_CODE_TOKENS, EMBEDDING_DIM
 
 # Store model cache inside project folder so it doesn't pollute user home
-_MODEL_CACHE = Path(__file__).parent / "models"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_MODEL_CACHE = _PROJECT_ROOT / "models"
 _MODEL_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(_MODEL_CACHE))
 os.environ.setdefault("HF_HUB_CACHE", str(_MODEL_CACHE / "hub"))

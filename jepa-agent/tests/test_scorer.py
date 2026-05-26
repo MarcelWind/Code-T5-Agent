@@ -4,7 +4,7 @@ import sys
 sys.path.insert(0, ".")
 
 import numpy as np
-from scorer import jepa_loss, cosine_distance, l2_distance, rank_candidates
+from core.scorer import jepa_loss, cosine_distance, l2_distance, rank_candidates
 
 
 def test_cosine_distance():

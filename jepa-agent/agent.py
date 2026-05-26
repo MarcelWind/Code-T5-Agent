@@ -14,11 +14,11 @@ Flow per step:
 
 import numpy as np
 
-from encoder import CodeEncoder
-from predictor import DeepSeekPredictor
-from scorer import jepa_loss, rank_candidates
-from executor import Workspace, read_file, apply_patch
-from config import NUM_CANDIDATES, MAX_STEPS, JEPA_LOSS_TYPE
+from core.encoder import CodeEncoder
+from core.predictor import DeepSeekPredictor
+from core.scorer import jepa_loss, rank_candidates
+from core.executor import Workspace, read_file, apply_patch
+from core.config import NUM_CANDIDATES, MAX_STEPS, JEPA_LOSS_TYPE
 
 
 class JEPAAgent:

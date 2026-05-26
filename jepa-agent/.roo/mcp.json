@@ -1,0 +1,54 @@
+{
+  "mcpServers": {
+    "local_router": {
+      "command": "python",
+      "args": ["-m", "mcp.local_router.server"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "HF_HOME": "${workspaceFolder}/models",
+        "HF_HUB_CACHE": "${workspaceFolder}/models/hub"
+      }
+    },
+    "code_understanding": {
+      "command": "python",
+      "args": ["-m", "mcp.code_understanding.server"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "HF_HOME": "${workspaceFolder}/models",
+        "HF_HUB_CACHE": "${workspaceFolder}/models/hub"
+      }
+    },
+    "semantic_search": {
+      "command": "python",
+      "args": ["-m", "mcp.semantic_search.server"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "HF_HOME": "${workspaceFolder}/models",
+        "HF_HUB_CACHE": "${workspaceFolder}/models/hub"
+      }
+    },
+    "obsidian_brain": {
+      "command": "python",
+      "args": ["-m", "mcp.obsidian_brain.server"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "VAULT_PATH": "${workspaceFolder}/vault"
+      }
+    },
+    "cloud_execution": {
+      "command": "python",
+      "args": ["-m", "mcp.cloud_execution.server"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}",
+        "DEEPSEEK_API_KEY": ""
+      }
+    },
+    "validators": {
+      "command": "python",
+      "args": ["-m", "mcp.validators.server"],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  }
+}

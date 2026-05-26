@@ -3,7 +3,9 @@
 import sys
 sys.path.insert(0, ".")
 
-from encoder import CodeEncoder
+import numpy as np
+
+from core.encoder import CodeEncoder
 
 
 def test_encode_shape():
@@ -33,7 +35,7 @@ def test_similar_code_close():
     b = "def hello(): print('hi')"
     emb_a = enc.encode(a)
     emb_b = enc.encode(b)
-    from scorer import cosine_distance
+    from core.scorer import cosine_distance
     d = cosine_distance(emb_a, emb_b)
     assert d < 0.01, f"Identical code should have near-zero distance, got {d:.4f}"
     print(f"  ✓ identical code → cosine distance = {d:.6f}")
@@ -45,7 +47,7 @@ def test_different_code_far():
     b = "class Calculator: pass"
     emb_a = enc.encode(a)
     emb_b = enc.encode(b)
-    from scorer import cosine_distance
+    from core.scorer import cosine_distance
     d = cosine_distance(emb_a, emb_b)
     assert d > 0.01, f"Different code should have non-zero distance, got {d:.4f}"
     print(f"  ✓ different code → cosine distance = {d:.6f}")

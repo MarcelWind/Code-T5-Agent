@@ -5,7 +5,7 @@ Compares predicted embedding (Z_hat) vs actual embedding (Z) to rank candidates.
 
 import numpy as np
 
-from config import JEPA_LOSS_TYPE, JEPA_TEMPERATURE
+from .config import JEPA_LOSS_TYPE, JEPA_TEMPERATURE
 
 
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:

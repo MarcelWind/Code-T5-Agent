@@ -8,7 +8,7 @@ import json
 import re
 from openai import OpenAI
 
-from config import (
+from .config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
