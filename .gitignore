@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# HuggingFace model cache (download on demand)
+models/
+
+# API keys
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test artifacts
+*.bak
+*.orig
+
+# Memory vault (user-specific notes)
+vault/
