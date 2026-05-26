@@ -1,154 +1,301 @@
-"""JEPA agent loop — core pipeline.
+"""JEPA agent — MCP-orchestrated pipeline.
 
-Flow per step:
-1. Read file → CodeT5+ encode → S_t (current embedding)
-2. DeepSeek generates N candidate patches + expected_code
-3. For each candidate:
-   a. Encode expected_code → Z_hat (predicted embedding)
-   b. Encode actual patched code → Z_actual
-   c. JEPA loss = distance(Z_hat, Z_actual)
-4. Select lowest-loss candidate
-5. Apply best patch to file
-6. Return result
+Replaces direct core imports with calls to 6 MCP servers:
+  local_router      → intent routing
+  code_understanding → AST analysis (tree-sitter)
+  semantic_search   → CodeT5+ embeddings
+  obsidian_brain    → vault memory
+  cloud_execution   → DeepSeek API
+  validators        → JEPA scoring
 """
+
+import asyncio
+import json
+import os
+import sys
+from typing import Any
 
 import numpy as np
 
-from core.encoder import CodeEncoder
-from core.predictor import DeepSeekPredictor
-from core.scorer import jepa_loss, rank_candidates
-from core.executor import Workspace, read_file, apply_patch
+from mcp import ClientSession
+from mcp.client.stdio import stdio_client, StdioServerParameters
+
+from core.executor import read_file, apply_patch
 from core.config import NUM_CANDIDATES, MAX_STEPS, JEPA_LOSS_TYPE
 
 
+# ── Helpers ──
+
+def _parse_tool_result(result) -> Any:
+    """Extract Python object from MCP CallToolResult."""
+    if result.isError:
+        text = result.content[0].text if result.content else "Unknown error"
+        return {"_error": text}
+    texts = []
+    for c in result.content:
+        if hasattr(c, "text"):
+            texts.append(c.text)
+    combined = "\n".join(texts)
+    if not combined:
+        return {}
+    try:
+        return json.loads(combined)
+    except (json.JSONDecodeError, TypeError):
+        return combined
+
+
+# ── MCP Connection Manager ──
+
+SERVER_DEFS = {
+    "local_router": {
+        "module": "mcp_servers.local_router.server",
+        "args": [],
+        "env": {"PYTHONPATH": "."},
+    },
+    "code_understanding": {
+        "module": "mcp_servers.code_understanding.server",
+        "args": [],
+        "env": {"PYTHONPATH": ".", "HF_HOME": "models", "HF_HUB_CACHE": "models/hub"},
+    },
+    "semantic_search": {
+        "module": "mcp_servers.semantic_search.server",
+        "args": [],
+        "env": {"PYTHONPATH": ".", "HF_HOME": "models", "HF_HUB_CACHE": "models/hub"},
+    },
+    "obsidian_brain": {
+        "module": "mcp_servers.obsidian_brain.server",
+        "args": [],
+        "env": {"PYTHONPATH": ".", "VAULT_PATH": "vault"},
+    },
+    "cloud_execution": {
+        "module": "mcp_servers.cloud_execution.server",
+        "args": [],
+        "env": {"PYTHONPATH": ".", "DEEPSEEK_API_KEY": os.environ.get("DEEPSEEK_API_KEY", "")},
+    },
+    "validators": {
+        "module": "mcp_servers.validators.server",
+        "args": [],
+        "env": {"PYTHONPATH": ".", "HF_HOME": "models", "HF_HUB_CACHE": "models/hub"},
+    },
+}
+
+
+class MCPConnection:
+    """A single stdio MCP server connection."""
+
+    def __init__(self, name: str, module: str, args: list[str] | None = None, env: dict | None = None):
+        self.name = name
+        self.params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", module] + (args or []),
+            env={**os.environ, **(env or {})},
+        )
+        self.session: ClientSession | None = None
+        self._streams = None
+        self._client_ctx = None
+
+    async def connect(self):
+        ctx = stdio_client(self.params)
+        self._client_ctx = ctx
+        streams = await ctx.__aenter__()
+        read_stream, write_stream = streams
+        session = ClientSession(read_stream, write_stream)
+        await session.__aenter__()
+        await session.initialize()
+        self.session = session
+        print(f"  [mcp] connected \u2192 {self.name}")
+
+    async def disconnect(self):
+        if self.session:
+            await self.session.__aexit__(None, None, None)
+            self.session = None
+        if self._client_ctx:
+            await self._client_ctx.__aexit__(None, None, None)
+            self._client_ctx = None
+
+    async def call(self, tool: str, **kwargs) -> Any:
+        if not self.session:
+            await self.connect()
+        result = await self.session.call_tool(tool, arguments=kwargs or None)
+        return _parse_tool_result(result)
+
+
 class JEPAAgent:
-    """JEPA-style coding agent."""
+    """MCP-orchestrated JEPA coding agent."""
 
     def __init__(self):
-        print("[JEPAAgent] initializing encoder + predictor...")
-        self.encoder = CodeEncoder()
-        self.predictor = DeepSeekPredictor()
-        self.workspace = Workspace()
         self.history: list[dict] = []
+        self._servers: dict[str, MCPConnection] = {}
+        print("[JEPAAgent] MCP-orchestrated agent initialized")
 
-    def step(
-        self,
-        task: str,
-        file_path: str,
-        k: int = NUM_CANDIDATES,
-    ) -> dict:
-        """Single JEPA step: observe → predict → score → execute."""
-        # 1. Observe current state
+    async def _ensure_server(self, name: str):
+        if name not in self._servers:
+            cfg = SERVER_DEFS[name]
+            conn = MCPConnection(name=name, module=cfg["module"], args=cfg.get("args", []), env=cfg.get("env"))
+            await conn.connect()
+            self._servers[name] = conn
+
+    async def _call(self, server: str, tool: str, **kwargs) -> Any:
+        await self._ensure_server(server)
+        return await self._servers[server].call(tool, **kwargs)
+
+    async def _encode(self, code: str) -> list[float]:
+        result = await self._call("semantic_search", "encode_code", code=code)
+        if isinstance(result, dict) and "embedding" in result:
+            return result["embedding"]
+        raise ValueError(f"encode_code failed: {result}")
+
+    async def _plan_actions(self, code: str, task: str, k: int = 5) -> list[dict]:
+        result = await self._call("cloud_execution", "plan_actions", code_context=code, task=task, k=k)
+        if isinstance(result, dict) and "candidates" in result:
+            return result["candidates"]
+        if isinstance(result, list):
+            return result
+        raise ValueError(f"plan_actions failed: {result}")
+
+    async def _score_pair(self, desc: str, code: str, loss_type: str = "cosine") -> float:
+        result = await self._call("validators", "validate_code", predicted_description=desc, actual_code=code, loss_type=loss_type)
+        if isinstance(result, dict) and "loss" in result:
+            return result["loss"]
+        raise ValueError(f"validate_code failed: {result}")
+
+    async def _rank(self, candidates: list, loss_type: str = "cosine") -> dict:
+        result = await self._call("validators", "rank_candidates", candidates=candidates, loss_type=loss_type)
+        if isinstance(result, dict) and "rankings" in result:
+            return result
+        raise ValueError(f"rank_candidates failed: {result}")
+
+    async def _validate_syntax(self, code: str) -> dict:
+        return await self._call("validators", "validate_syntax", code=code, language="python")
+
+    async def _vault_write(self, path: str, content: str, overwrite: bool = False) -> dict:
+        return await self._call("obsidian_brain", "write_vault", path=path, content=content, overwrite=overwrite)
+
+    async def step(self, task: str, file_path: str, k: int = NUM_CANDIDATES) -> dict:
+        """Single JEPA step: observe -> predict -> score -> execute (async MCP)."""
         code = read_file(file_path)
         if not code:
             return {"error": f"File not found or empty: {file_path}"}
 
-        S_t = self.encoder.encode(code)  # current embedding
-        print(f"  [step] encoded current state → dim={S_t.shape}")
+        try:
+            S_t = await self._encode(code)
+            print(f"  [step] encoded current state -> dim={len(S_t)}")
+        except Exception as e:
+            return {"error": f"Encoding failed: {e}"}
 
-        # 2. DeepSeek proposes candidates
-        candidates = self.predictor.plan_actions(code, task, k=k)
-        print(f"  [step] generated {len(candidates)} candidates")
+        try:
+            candidates = await self._plan_actions(code, task, k=k)
+            print(f"  [step] generated {len(candidates)} candidates")
+        except Exception as e:
+            return {"error": f"Planning failed: {e}"}
 
         if not candidates:
             return {"error": "No candidates generated", "state_embedding": S_t}
 
-        # 3. Score each candidate via JEPA loss
-        predicted_embs: list[np.ndarray] = []
-        actual_embs: list[np.ndarray] = []
+        scored_inputs = []
+        for cand in candidates:
+            desc = cand.get("change_description", cand.get("description", ""))
+            exp_code = cand.get("expected_code", "")
+            if desc and exp_code:
+                scored_inputs.append({"change_description": desc, "expected_code": exp_code, "description": cand.get("description", "")[:60]})
+
+        if not scored_inputs:
+            for cand in candidates:
+                scored_inputs.append({"change_description": task, "expected_code": cand.get("expected_code", code), "description": cand.get("description", "")[:60]})
+
+        try:
+            ranking = await self._rank(scored_inputs, loss_type=JEPA_LOSS_TYPE)
+            best_loss = ranking["best_loss"]
+            losses = ranking["losses"]
+            rankings = ranking["rankings"]
+            # Map back to original indices
+            desc_to_orig = {}
+            for i, cand in enumerate(candidates):
+                d = cand.get("change_description", cand.get("description", ""))
+                desc_to_orig[d] = i
+            orig_rankings = []
+            for r in rankings:
+                si = scored_inputs[r]
+                orig_idx = desc_to_orig.get(si["change_description"], r)
+                orig_rankings.append(orig_idx)
+            best_idx = orig_rankings[0] if orig_rankings else 0
+        except Exception as e:
+            print(f"  [step] ranking server failed ({e}), scoring locally...")
+            losses_local = []
+            for si in scored_inputs:
+                loss = await self._score_pair(si["change_description"], si["expected_code"], JEPA_LOSS_TYPE)
+                losses_local.append(loss)
+            if losses_local:
+                best_idx = int(np.argmin(losses_local))
+                best_loss = losses_local[best_idx]
+                losses = losses_local
+            else:
+                best_idx = 0
+                best_loss = 1.0
+                losses = [1.0]
 
         for i, cand in enumerate(candidates):
-            expected_code = cand.get("expected_code", "")
-            change_desc = cand.get("change_description", "")
-            description = cand.get("description", "")
-
-            # Predicted embedding Z_hat — from DeepSeek's semantic description
-            # This is the "latent prediction": what should the code state feel like?
-            Z_hat = self.encoder.encode(change_desc if change_desc else description)
-
-            # Actual embedding Z — from the actual code after applying the patch
-            # In prototype, candidate.expected_code IS the resulting code
-            Z_actual = self.encoder.encode(expected_code)
-
-            predicted_embs.append(Z_hat)
-            actual_embs.append(Z_actual)
-
-            loss = jepa_loss(Z_hat, Z_actual, JEPA_LOSS_TYPE)
-            print(f"  [step]   candidate {i}: {description[:50]}... loss={loss:.4f}")
-
-        # 4. Rank by JEPA loss
-        if len(candidates) > 1:
-            # Cross-evaluation: compute loss between each candidate's predicted
-            # embedding (Z_hat from change_description) and each candidate's
-            # actual embedding (Z from expected_code).
-            # Best candidate = whose prediction best aligns with reality.
-            n = len(candidates)
-            loss_matrix = np.zeros((n, n))
-            for i in range(n):
-                for j in range(n):
-                    loss_matrix[i, j] = jepa_loss(
-                        predicted_embs[i], actual_embs[j], JEPA_LOSS_TYPE
-                    )
-
-            # Self-consistency: diagonal of matrix
-            # (how well each candidate's prediction matches its own actual output)
-            self_scores = [loss_matrix[i, i] for i in range(n)]
-
-            # Cross-consistency: how well each candidate's prediction matches
-            # the AVERAGE actual encoding across all candidates
-            avg_actual = np.mean(actual_embs, axis=0)
-            cross_scores = [
-                jepa_loss(predicted_embs[i], avg_actual, JEPA_LOSS_TYPE)
-                for i in range(n)
-            ]
-
-            # Combine: use self-consistency as primary score
-            scores = self_scores
-            best_idx = int(np.argmin(scores))
-        else:
-            best_idx = 0
-            scores = [0.0]
+            desc = cand.get("description", "")[:50]
+            loss_str = f" loss={losses[i]:.4f}" if i < len(losses) else ""
+            print(f"  [step]   candidate {i}: {desc}...{loss_str}")
 
         best_candidate = candidates[best_idx]
         best_code = best_candidate.get("expected_code", "")
+        print(f"  [step] selected candidate {best_idx} (loss={best_loss:.4f})")
 
-        print(f"  [step] selected candidate {best_idx} (loss={scores[best_idx]:.4f})")
+        syntax = await self._validate_syntax(best_code)
+        if not syntax.get("valid", False):
+            print(f"  [step] ! best candidate has syntax errors")
 
-        # 5. Execute: apply best patch
         success = apply_patch(file_path, best_code)
 
+        try:
+            vcontent = f"# JEPA Step {len(self.history) + 1}\n\n**Task:** {task}\n**File:** {file_path}\n**Selected:** candidate {best_idx}\n**JEPA Loss:** {best_loss:.4f}\n"
+            await self._vault_write(f"lessons/step-{len(self.history) + 1}.md", vcontent, overwrite=True)
+        except Exception:
+            pass
+
         result = {
-            "step": len(self.history) + 1,
-            "task": task,
-            "file": file_path,
-            "best_idx": best_idx,
-            "best_description": best_candidate.get("description", ""),
-            "jepa_loss": float(scores[best_idx]),
-            "all_losses": [float(s) for s in scores],
-            "success": success,
-            "num_candidates": len(candidates),
+            "step": len(self.history) + 1, "task": task, "file": file_path,
+            "best_idx": best_idx, "best_description": best_candidate.get("description", ""),
+            "jepa_loss": float(best_loss), "all_losses": [float(l) for l in losses],
+            "success": success, "num_candidates": len(candidates),
+            "syntax_valid": syntax.get("valid", False),
         }
         self.history.append(result)
         return result
 
-    def run(
-        self,
-        task: str,
-        file_path: str,
-        max_steps: int = MAX_STEPS,
-    ) -> list[dict]:
+    async def run(self, task: str, file_path: str, max_steps: int = MAX_STEPS) -> list[dict]:
         """Multi-step JEPA loop."""
         results = []
-        for _ in range(max_steps):
-            result = self.step(task, file_path)
+        for step_num in range(1, max_steps + 1):
+            print(f"\n{'='*50}\n  JEPA Step {step_num}/{max_steps}\n{'='*50}")
+            result = await self.step(task, file_path)
             results.append(result)
             if result.get("jepa_loss", 1.0) < 0.01:
-                # Near-zero loss → prediction matched reality perfectly → done
                 print("[JEPAAgent] Converged (loss near zero).")
                 break
             if not result.get("success"):
                 print("[JEPAAgent] Step failed, stopping.")
                 break
-            # Update task for next step if needed
             task = f"Continue fixing. Previous attempt: {result.get('best_description', '')}"
         return results
+
+    async def cleanup(self):
+        for name in list(self._servers.keys()):
+            try:
+                await self._servers[name].disconnect()
+            except Exception:
+                pass
+        self._servers.clear()
+
+
+def run_agent(task: str, file_path: str, k: int = NUM_CANDIDATES, steps: int = MAX_STEPS) -> list[dict]:
+    """Synchronous entry point. Runs the async agent loop."""
+    async def _run():
+        agent = JEPAAgent()
+        try:
+            return await agent.run(task=task, file_path=file_path, max_steps=steps)
+        finally:
+            await agent.cleanup()
+    return asyncio.run(_run())
