@@ -1,32 +1,143 @@
 """MCP Server: code_understanding — AST-aware code analysis using tree-sitter.
 
 Provides tools for parsing code, extracting functions/classes, finding symbols,
-and analyzing import structure across Python files.
+and analyzing import structure across multiple languages.
+
+Supported languages: python, javascript, typescript, tsx, go, rust, java,
+ruby, php, c, cpp. Detection is automatic via file extension, shebang,
+or keyword heuristics. Missing parsers can be installed on demand.
 """
 
 import os
 from typing import Optional
 
 from mcp.server import FastMCP
+from tree_sitter import Node
 
-import tree_sitter_python as tspython
-from tree_sitter import Language, Parser, Node
+from mcp_servers.code_understanding.language import (
+    LANGUAGE_REGISTRY,
+    detect_language,
+    get_parser,
+    get_installed_languages,
+    installable_languages as get_installable_languages,
+    install_language as do_install_language,
+)
 
 server = FastMCP(
     "code_understanding",
-    instructions="AST-aware code analysis. Parse code, extract functions/classes, find symbols.",
+    instructions="AST-aware multi-language code analysis. Supports python, javascript, "
+    "typescript, tsx, go, rust, java, ruby, php, c, cpp. Auto-detects language "
+    "or accepts explicit 'language' parameter. Missing parsers installable on demand.",
 )
 
-# ── Initialize tree-sitter parser ──
 
-PY_LANGUAGE = Language(tspython.language())
-_parser = Parser(PY_LANGUAGE)
+# ── Language-specific AST node types ──
+
+# Function definition node types per language
+_FUNCTION_NODE_TYPES: dict[str, list[str]] = {
+    "python": ["function_definition"],
+    "javascript": ["function_declaration", "arrow_function", "method_definition"],
+    "typescript": ["function_declaration", "arrow_function", "method_definition"],
+    "tsx": ["function_declaration", "arrow_function", "method_definition"],
+    "go": ["function_declaration", "method_declaration"],
+    "rust": ["function_item"],
+    "java": ["method_declaration"],
+    "ruby": ["method"],
+    "php": ["function_definition"],
+    "c": ["function_definition"],
+    "cpp": ["function_definition"],
+}
+
+# Class definition node types per language
+_CLASS_NODE_TYPES: dict[str, list[str]] = {
+    "python": ["class_definition"],
+    "javascript": ["class_declaration"],
+    "typescript": ["class_declaration"],
+    "tsx": ["class_declaration"],
+    "go": ["type_spec"],  # Go uses type Foo struct {}
+    "rust": ["struct_item", "enum_item"],
+    "java": ["class_declaration"],
+    "ruby": ["class"],
+    "php": ["class_declaration"],
+    "c": ["struct_specifier"],
+    "cpp": ["class_specifier"],
+}
+
+# Symbol types to search for find_symbol
+_SYMBOL_NODE_TYPES: dict[str, list[str]] = {
+    "python": ["function_definition", "class_definition", "assignment"],
+    "javascript": ["function_declaration", "class_declaration", "variable_declarator"],
+    "typescript": ["function_declaration", "class_declaration", "variable_declarator"],
+    "tsx": ["function_declaration", "class_declaration", "variable_declarator"],
+    "go": ["function_declaration", "type_spec", "var_spec"],
+    "rust": ["function_item", "struct_item", "let_declaration"],
+    "java": ["method_declaration", "class_declaration", "variable_declarator"],
+    "ruby": ["method", "class", "assignment"],
+    "php": ["function_definition", "class_declaration", "assignment"],
+    "c": ["function_definition", "struct_specifier", "declaration"],
+    "cpp": ["function_definition", "class_specifier", "declaration"],
+}
 
 
-def _get_parser() -> Parser:
-    """Lazy-init parser (reuse across calls)."""
-    global _parser
-    return _parser
+# ── Language resolution helper ──
+
+
+def _resolve_language(code: str, language: str, file_path: str | None = None) -> tuple[str | None, dict | None]:
+    """Resolve 'auto' or explicit language to a parser and lang string.
+
+    Returns:
+        (lang_string, None) on success.
+        (None, error_dict) on failure.
+    """
+    if language == "auto":
+        detected = detect_language(code, file_path)
+        lang = detected["language"]
+        if not detected["installed"]:
+            return None, {
+                "error": f"Parser not installed for detected language '{lang}'",
+                "detected": detected,
+                "suggestion": f"Use install_language tool: install_language('{lang}')",
+            }
+    else:
+        lang = language
+
+    parser, err = get_parser(lang)
+    if err:
+        return None, err
+    return lang, parser
+
+
+# ── New MCP tools ──
+
+
+@server.tool()
+def detect(file_path: str = "", code: str = "") -> dict:
+    """Detect programming language from file path or code content.
+
+    Args:
+        file_path: File path (extension used for detection).
+        code: Code snippet (shebang/keywords used if no file_path).
+
+    Returns:
+        Dictionary with language, detected_by, confidence, installed, can_install, install_cmd.
+    """
+    return detect_language(code, file_path or None)
+
+
+@server.tool()
+def install_language(language: str) -> dict:
+    """Install a tree-sitter parser package for a language.
+
+    Args:
+        language: Language name (e.g. 'javascript', 'go', 'rust').
+
+    Returns:
+        Dictionary with success status and message.
+    """
+    return do_install_language(language)
+
+
+# ── AST walking helpers ──
 
 
 def _walk_tree(node: Node, depth: int = 0) -> list[dict]:
@@ -54,22 +165,25 @@ def _find_nodes_of_type(node: Node, target_type: str) -> list[Node]:
 
 
 @server.tool()
-def parse_code(code: str, detail: str = "overview") -> dict:
+def parse_code(code: str, language: str = "auto", detail: str = "overview") -> dict:
     """Parse code string into AST structure.
 
     Args:
         code: Source code string to parse.
+        language: Language name ('auto', 'python', 'javascript', etc.).
         detail: 'overview' (default) for top-level nodes, 'full' for complete AST.
 
     Returns:
         dict with 'language', 'syntax_valid', 'ast', and optionally 'error'.
     """
-    parser = _get_parser()
-    tree = parser.parse(code.encode("utf-8"))
+    lang, parser_or_err = _resolve_language(code, language)
+    if lang is None:
+        return {"language": "unknown", "syntax_valid": False, "ast": [], **parser_or_err}
+    tree = parser_or_err.parse(code.encode("utf-8"))
 
     if tree.root_node.has_error:
         return {
-            "language": "python",
+            "language": lang,
             "syntax_valid": False,
             "ast": [],
             "error": "Syntax errors detected in code.",
@@ -78,26 +192,33 @@ def parse_code(code: str, detail: str = "overview") -> dict:
     ast_nodes = _walk_tree(tree.root_node, depth=0 if detail == "full" else 3)
 
     return {
-        "language": "python",
+        "language": lang,
         "syntax_valid": True,
         "ast": ast_nodes[:200],  # cap at 200 nodes
     }
 
 
 @server.tool()
-def get_functions(code: str, include_body: bool = False) -> list[dict]:
-    """Extract all function definitions from Python code.
+def get_functions(code: str, language: str = "auto", include_body: bool = False) -> list[dict]:
+    """Extract all function definitions from code.
 
     Args:
         code: Source code string.
+        language: Language name ('auto', 'python', 'javascript', etc.).
         include_body: If True, include full function body text.
 
     Returns:
         List of function dicts with name, params, start_line, end_line, and optionally body.
     """
-    parser = _get_parser()
-    tree = parser.parse(code.encode("utf-8"))
-    func_nodes = _find_nodes_of_type(tree.root_node, "function_definition")
+    lang, parser_or_err = _resolve_language(code, language)
+    if lang is None:
+        return [{"_error": parser_or_err.get("error", "Unknown error")}]
+    tree = parser_or_err.parse(code.encode("utf-8"))
+
+    node_types = _FUNCTION_NODE_TYPES.get(lang, ["function_definition", "function_declaration"])
+    func_nodes = []
+    for nt in node_types:
+        func_nodes.extend(_find_nodes_of_type(tree.root_node, nt))
 
     functions = []
     for node in func_nodes:
@@ -136,19 +257,26 @@ def get_functions(code: str, include_body: bool = False) -> list[dict]:
 
 
 @server.tool()
-def get_classes(code: str, include_methods: bool = False) -> list[dict]:
-    """Extract all class definitions from Python code.
+def get_classes(code: str, language: str = "auto", include_methods: bool = False) -> list[dict]:
+    """Extract all class definitions from code.
 
     Args:
         code: Source code string.
+        language: Language name ('auto', 'python', 'javascript', etc.).
         include_methods: If True, include method details for each class.
 
     Returns:
         List of class dicts with name, bases, start_line, end_line, and optionally methods.
     """
-    parser = _get_parser()
-    tree = parser.parse(code.encode("utf-8"))
-    class_nodes = _find_nodes_of_type(tree.root_node, "class_definition")
+    lang, parser_or_err = _resolve_language(code, language)
+    if lang is None:
+        return [{"_error": parser_or_err.get("error", "Unknown error")}]
+    tree = parser_or_err.parse(code.encode("utf-8"))
+
+    node_types = _CLASS_NODE_TYPES.get(lang, ["class_definition", "class_declaration"])
+    class_nodes = []
+    for nt in node_types:
+        class_nodes.extend(_find_nodes_of_type(tree.root_node, nt))
 
     classes = []
     for node in class_nodes:
@@ -166,7 +294,7 @@ def get_classes(code: str, include_methods: bool = False) -> list[dict]:
         if include_methods and body_node:
             methods = []
             for child in body_node.children:
-                if child.type == "function_definition":
+                if child.type in ("function_definition", "method_definition"):
                     m_name = child.child_by_field_name("name")
                     m_params = child.child_by_field_name("parameters")
                     methods.append({
@@ -183,18 +311,21 @@ def get_classes(code: str, include_methods: bool = False) -> list[dict]:
 
 
 @server.tool()
-def find_symbol(code: str, symbol_name: str) -> list[dict]:
+def find_symbol(code: str, symbol_name: str, language: str = "auto") -> list[dict]:
     """Find all occurrences of a symbol (function, class, variable) in code.
 
     Args:
         code: Source code string.
         symbol_name: Name of the symbol to find.
+        language: Language name ('auto', 'python', 'javascript', etc.).
 
     Returns:
         List of symbol occurrences with type, location, and context.
     """
-    parser = _get_parser()
-    tree = parser.parse(code.encode("utf-8"))
+    lang, parser_or_err = _resolve_language(code, language)
+    if lang is None:
+        return [{"_error": parser_or_err.get("error", "Unknown error")}]
+    tree = parser_or_err.parse(code.encode("utf-8"))
 
     results = []
     lines = code.split("\n")
@@ -220,17 +351,20 @@ def find_symbol(code: str, symbol_name: str) -> list[dict]:
 
 
 @server.tool()
-def get_imports(code: str) -> list[dict]:
-    """Extract all import statements from Python code.
+def get_imports(code: str, language: str = "auto") -> list[dict]:
+    """Extract all import statements from code.
 
     Args:
         code: Source code string.
+        language: Language name ('auto', 'python', 'javascript', etc.).
 
     Returns:
         List of import dicts with type (import/from), module, and names.
     """
-    parser = _get_parser()
-    tree = parser.parse(code.encode("utf-8"))
+    lang, parser_or_err = _resolve_language(code, language)
+    if lang is None:
+        return [{"_error": parser_or_err.get("error", "Unknown error")}]
+    tree = parser_or_err.parse(code.encode("utf-8"))
 
     imports = []
 

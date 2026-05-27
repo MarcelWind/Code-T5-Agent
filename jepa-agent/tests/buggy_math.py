@@ -1,13 +1,16 @@
 from typing import List
+import math
 
 
 def compute_sum(n: int) -> int:
-    """Return sum of numbers from 1 to n (inclusive)."""
-    return sum(range(1, n + 1))
+    """Return sum of numbers from 0 to n-1 (inclusive)."""
+    return n * (n - 1) // 2
 
 
 def divide(a: float, b: float) -> float:
-    """Return a divided by b."""
+    """Return a divided by b. Returns NaN if b is zero."""
+    if math.isclose(b, 0.0):
+        return math.nan
     return a / b
 
 
