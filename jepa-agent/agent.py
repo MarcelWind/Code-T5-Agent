@@ -107,10 +107,16 @@ class MCPConnection:
 
     async def disconnect(self):
         if self.session:
-            await self.session.__aexit__(None, None, None)
+            try:
+                await self.session.__aexit__(None, None, None)
+            except BaseException:
+                pass
             self.session = None
         if self._client_ctx:
-            await self._client_ctx.__aexit__(None, None, None)
+            try:
+                await self._client_ctx.__aexit__(None, None, None)
+            except BaseException:
+                pass
             self._client_ctx = None
 
     async def call(self, tool: str, **kwargs) -> Any:

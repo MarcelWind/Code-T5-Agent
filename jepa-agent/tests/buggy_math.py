@@ -1,9 +1,13 @@
-from typing import List
+from typing import List, Generator, Union
 import math
 
 
 def compute_sum(n: int) -> int:
-    """Return sum of numbers from 0 to n-1 (inclusive)."""
+    """Return sum of numbers from 0 to n-1."""
+    if not isinstance(n, int):
+        raise TypeError("n must be an integer")
+    if n <= 0:
+        return 0
     return n * (n - 1) // 2
 
 
@@ -14,13 +18,19 @@ def divide(a: float, b: float) -> float:
     return a / b
 
 
-def fibonacci(n: int) -> List[int]:
-    """Return first n Fibonacci numbers."""
-    if n <= 0:
-        return []
-    if n == 1:
-        return [0]
-    result = [0, 1]
-    for i in range(n - 2):
-        result.append(result[-1] + result[-2])
-    return result
+def fibonacci(n: int, as_list: bool = True) -> Union[List[int], Generator[int, None, None]]:
+    """Return first n Fibonacci numbers. If as_list is True (default), return list; else return generator."""
+    if not isinstance(n, int):
+        raise TypeError("n must be an integer")
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    if n > 1000000:
+        raise OverflowError("n too large, may cause memory issues")
+    def gen() -> Generator[int, None, None]:
+        a, b = 0, 1
+        for _ in range(n):
+            yield a
+            a, b = b, a + b
+    if as_list:
+        return list(gen())
+    return gen()
