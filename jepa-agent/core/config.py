@@ -1,6 +1,11 @@
-"""JEPA Coding Agent - Configuration."""
+"""JEPA Coding Agent - Configuration.
+
+Version: 0.1.0
+"""
 
 import os
+
+__version__ = '0.1.0'
 
 # ── DeepSeek Flash API ──
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")

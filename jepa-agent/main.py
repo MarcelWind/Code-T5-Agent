@@ -5,6 +5,15 @@ import asyncio
 import sys
 import os
 
+# ── Load .env from project root ──
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+if os.path.isfile(_env_path):
+    for _line in open(_env_path, encoding="utf-8"):
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _key, _, _val = _line.partition("=")
+            os.environ.setdefault(_key.strip(), _val.strip().strip('"').strip("'"))
+
 # Ensure DEEPSEEK_API_KEY is set
 if not os.environ.get("DEEPSEEK_API_KEY"):
     print("Warning: DEEPSEEK_API_KEY env var not set.")

@@ -20,7 +20,7 @@ import numpy as np
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
-from core.executor import read_file, apply_patch
+from core.executor import read_file, apply_patch, run_command
 from core.config import NUM_CANDIDATES, MAX_STEPS, JEPA_LOSS_TYPE
 from core.onboarding import (
     detect_project_root,
@@ -279,6 +279,19 @@ class JEPAAgent:
             "success": success, "num_candidates": len(candidates),
             "syntax_valid": syntax.get("valid", False),
         }
+
+        # ── Run tests after patch ──
+        if success:
+            _agent_dir = os.path.dirname(os.path.abspath(__file__))
+            _stdout, _stderr, _ec = run_command(f'"{sys.executable}" -m pytest tests/ -q --tb=short', cwd=_agent_dir)
+            if _ec == 0:
+                print(f"  [step] all tests passed after patch")
+            else:
+                print(f"  [step] ! tests FAILED (exit={_ec})")
+                print(f"  [step] ! {_stderr[:200]}")
+            result["tests_exit"] = _ec
+            result["tests_stderr"] = _stderr[:200] if _stderr else ""
+
         self.history.append(result)
         return result
 
