@@ -22,6 +22,14 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 
 from core.executor import read_file, apply_patch
 from core.config import NUM_CANDIDATES, MAX_STEPS, JEPA_LOSS_TYPE
+from core.onboarding import (
+    detect_project_root,
+    detect_project_languages,
+    generate_project_profile,
+    load_project_profile,
+    save_project_profile,
+    format_profile_markdown,
+)
 
 
 # ── Helpers ──
@@ -132,6 +140,9 @@ class JEPAAgent:
     def __init__(self):
         self.history: list[dict] = []
         self._servers: dict[str, MCPConnection] = {}
+        self._project_root: str | None = None
+        self._project_profile: dict | None = None
+        self._onboarded: bool = False
         print("[JEPAAgent] MCP-orchestrated agent initialized")
 
     async def _ensure_server(self, name: str):
@@ -271,8 +282,80 @@ class JEPAAgent:
         self.history.append(result)
         return result
 
+    async def onboard(self, file_path: str, install_parsers: bool = False) -> dict:
+        """Run project onboarding: detect root, languages, check parsers, persist profile.
+
+        Idempotent — re-runs update the stored profile. Call before run() or standalone.
+        """
+        print("  [onboard] detecting project root...")
+        root = detect_project_root(file_path)
+        if not root:
+            print("  [onboard] ! could not determine project root")
+            return {"error": "No project root detected"}
+
+        # Load existing profile
+        existing = load_project_profile(root)
+        if existing:
+            print(f"  [onboard] found existing profile for {existing.get('project_name', root)}")
+            self._project_root = root
+            self._project_profile = existing
+            self._onboarded = True
+            return {"status": "loaded", "profile": existing}
+
+        print(f"  [onboard] project root: {root}")
+        languages = detect_project_languages(root)
+        print(f"  [onboard] detected languages: {[l['language'] for l in languages]}")
+
+        profile = generate_project_profile(root, languages)
+        self._project_root = root
+        self._project_profile = profile
+
+        # Save to .jepa-project.json
+        save_project_profile(profile)
+        print(f"  [onboard] saved profile to {root}/.jepa-project.json")
+
+        # Write to vault
+        md = format_profile_markdown(profile)
+        try:
+            await self._ensure_server("obsidian_brain")
+            await self._vault_write("rules/project-profile.md", md, overwrite=True)
+            print("  [onboard] wrote profile to vault: rules/project-profile.md")
+        except Exception as e:
+            print(f"  [onboard] ! vault write skipped: {e}")
+
+        # Check parsers for detected languages
+        missing = []
+        for lang_info in languages:
+            lang = lang_info["language"]
+            if lang == "unknown":
+                continue
+            if lang != "python":
+                missing.append(lang)
+
+        if missing:
+            print(f"  [onboard] ! missing parsers: {', '.join(missing)}")
+            if install_parsers:
+                for lang in missing:
+                    try:
+                        await self._ensure_server("code_understanding")
+                        r = await self._call("code_understanding", "install_language", language=lang)
+                        if isinstance(r, dict) and r.get("success"):
+                            print(f"  [onboard] installed parser: {lang}")
+                        else:
+                            print(f"  [onboard] ! failed to install {lang}: {r}")
+                    except Exception as e:
+                        print(f"  [onboard] ! install error for {lang}: {e}")
+
+        self._onboarded = True
+        return {"status": "created", "profile": profile, "missing_parsers": missing}
+
     async def run(self, task: str, file_path: str, max_steps: int = MAX_STEPS) -> list[dict]:
-        """Multi-step JEPA loop."""
+        """Multi-step JEPA loop. Auto-runs onboard on first call if no profile."""
+        if not self._onboarded:
+            onboard_result = await self.onboard(file_path)
+            if onboard_result.get("error"):
+                print(f"  [onboard] warning: {onboard_result['error']}")
+
         results = []
         for step_num in range(1, max_steps + 1):
             print(f"\n{'='*50}\n  JEPA Step {step_num}/{max_steps}\n{'='*50}")

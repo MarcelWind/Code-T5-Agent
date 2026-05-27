@@ -1,0 +1,18 @@
+{
+  "project_root": "D:\\Documents\\Python\\Code T5 Agent",
+  "project_name": "Code T5 Agent",
+  "languages": [
+    {
+      "language": "python",
+      "detected_by": "config",
+      "confidence": 0.9,
+      "extensions": [
+        ".py"
+      ]
+    }
+  ],
+  "primary_language": "python",
+  "all_extensions": [
+    ".py"
+  ]
+}
