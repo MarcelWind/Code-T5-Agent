@@ -30,6 +30,34 @@ from core.onboarding import (
     save_project_profile,
     format_profile_markdown,
 )
+from core.code_index import (
+    get_index,
+    save_index,
+    needs_reparse,
+    extract_from_ast,
+    compute_diff,
+    format_diff_markdown,
+    format_symbol_summary,
+)
+
+
+# ── Extension → tree-sitter language mapping ──
+_ext_to_lang = {
+    ".py": "python",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".rs": "rust",
+    ".go": "go",
+    ".java": "java",
+    ".rb": "ruby",
+    ".php": "php",
+    ".c": "c",
+    ".cpp": "cpp",
+    ".h": "c",
+    ".hpp": "cpp",
+}
 
 
 # ── Helpers ──
@@ -93,10 +121,11 @@ class MCPConnection:
 
     def __init__(self, name: str, module: str, args: list[str] | None = None, env: dict | None = None):
         self.name = name
+        base_env = {**os.environ, **{"PYTHONIOENCODING": "utf-8"}, **(env or {})}
         self.params = StdioServerParameters(
             command=sys.executable,
             args=["-m", module] + (args or []),
-            env={**os.environ, **(env or {})},
+            env=base_env,
         )
         self.session: ClientSession | None = None
         self._streams = None
@@ -105,13 +134,29 @@ class MCPConnection:
     async def connect(self):
         ctx = stdio_client(self.params)
         self._client_ctx = ctx
-        streams = await ctx.__aenter__()
-        read_stream, write_stream = streams
-        session = ClientSession(read_stream, write_stream)
-        await session.__aenter__()
-        await session.initialize()
-        self.session = session
-        print(f"  [mcp] connected \u2192 {self.name}")
+        try:
+            streams = await ctx.__aenter__()
+            read_stream, write_stream = streams
+            session = ClientSession(read_stream, write_stream)
+            await session.__aenter__()
+            await session.initialize()
+            self.session = session
+            print(f"  [mcp] connected -> {self.name}")
+        except BaseException:
+            # If connection fails mid-init, clean up any partial state
+            if self.session:
+                try:
+                    await self.session.__aexit__(None, None, None)
+                except BaseException:
+                    pass
+                self.session = None
+            if self._client_ctx:
+                try:
+                    await self._client_ctx.__aexit__(None, None, None)
+                except BaseException:
+                    pass
+                self._client_ctx = None
+            raise
 
     async def disconnect(self):
         if self.session:
@@ -143,13 +188,18 @@ class JEPAAgent:
         self._project_root: str | None = None
         self._project_profile: dict | None = None
         self._onboarded: bool = False
+        self._code_index: dict | None = None
         print("[JEPAAgent] MCP-orchestrated agent initialized")
 
     async def _ensure_server(self, name: str):
         if name not in self._servers:
             cfg = SERVER_DEFS[name]
             conn = MCPConnection(name=name, module=cfg["module"], args=cfg.get("args", []), env=cfg.get("env"))
-            await conn.connect()
+            try:
+                await conn.connect()
+            except BaseException:
+                # On any failure (including CancelledError), make sure we don't leak server entry
+                raise
             self._servers[name] = conn
 
     async def _call(self, server: str, tool: str, **kwargs) -> Any:
@@ -188,6 +238,95 @@ class JEPAAgent:
     async def _vault_write(self, path: str, content: str, overwrite: bool = False) -> dict:
         return await self._call("obsidian_brain", "write_vault", path=path, content=content, overwrite=overwrite)
 
+    # ── Code Index (tree-sitter AST cache) ──
+
+    async def _ensure_code_index(self) -> dict:
+        """Load index from disk, or init empty if first time."""
+        if self._code_index is None:
+            self._code_index = get_index()
+        return self._code_index
+
+    async def _parse_ast(self, file_path: str, language: str = "python") -> dict | None:
+        """Parse a file via code_understanding server, return AST data or None."""
+        code = read_file(file_path)
+        if not code:
+            return None
+        try:
+            await self._ensure_server("code_understanding")
+            return await self._call("code_understanding", "parse_code", code=code, language=language, detail="overview")
+        except (Exception, asyncio.CancelledError) as e:
+            print(f"  [index] ! parse failed for {file_path}: {e}")
+            return None
+
+    async def _update_index_entry(self, file_path: str, language: str = "python") -> dict | None:
+        """Parse a file and update its entry in the index. Returns old entry if changed."""
+        idx = await self._ensure_code_index()
+        rel_path = os.path.relpath(file_path, self._project_root) if self._project_root else file_path
+        old_entry = idx.get("files", {}).get(rel_path)
+
+        code = read_file(file_path)
+        if not code:
+            return old_entry
+        ast_data = await self._parse_ast(file_path, language)
+        if ast_data and not ast_data.get("error"):
+            syms = extract_from_ast(ast_data, source_code=code)
+            new_entry = {
+                "mtime": os.path.getmtime(file_path),
+                "language": ast_data.get("language", language),
+                "size": os.path.getsize(file_path),
+                "symbols": syms,
+            }
+            idx.setdefault("files", {})[rel_path] = new_entry
+            save_index(idx)
+            return old_entry
+        return old_entry
+
+    async def _build_code_index(self, extensions: list[str]) -> int:
+        """Scan project source files and build the full code index. Returns file count."""
+        project_root = self._project_root
+        if not project_root:
+            return 0
+
+        ext_set = set(extensions)
+        scanned = 0
+
+        for dirpath, dirnames, filenames in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".")
+                           and d not in ("__pycache__", "node_modules", ".venv", "venv", "env", "models")]
+
+            for fn in filenames:
+                ext = os.path.splitext(fn)[1].lower()
+                if ext not in ext_set:
+                    continue
+
+                full_path = os.path.join(dirpath, fn)
+                rel_path = os.path.relpath(full_path, project_root)
+
+                # Determine language from extension
+                lang = _ext_to_lang.get(ext, "python")
+
+                try:
+                    file_code = read_file(full_path)
+                    if not file_code:
+                        continue
+                    ast_data = await self._parse_ast(full_path, language=lang)
+                    if ast_data and not ast_data.get("error"):
+                        syms = extract_from_ast(ast_data, source_code=file_code)
+                        idx = await self._ensure_code_index()
+                        idx.setdefault("files", {})[rel_path] = {
+                            "mtime": os.path.getmtime(full_path),
+                            "language": ast_data.get("language", lang),
+                            "size": os.path.getsize(full_path),
+                            "symbols": syms,
+                        }
+                        scanned += 1
+                except (Exception, asyncio.CancelledError):
+                    continue
+
+        save_index(self._code_index)
+        return scanned
+
     async def step(self, task: str, file_path: str, k: int = NUM_CANDIDATES) -> dict:
         """Single JEPA step: observe -> predict -> score -> execute (async MCP)."""
         code = read_file(file_path)
@@ -200,8 +339,36 @@ class JEPAAgent:
         except Exception as e:
             return {"error": f"Encoding failed: {e}"}
 
+        # ── AST context from tree-sitter index ──
+        ast_context = ""
         try:
-            candidates = await self._plan_actions(code, task, k=k)
+            idx = await self._ensure_code_index()
+            rel_path = os.path.relpath(file_path, self._project_root) if self._project_root else file_path
+            entry = idx.get("files", {}).get(rel_path)
+
+            if needs_reparse(file_path, entry):
+                old_entry = await self._update_index_entry(file_path)
+                entry = idx.get("files", {}).get(rel_path)
+                diff = compute_diff(
+                    (old_entry or {}).get("symbols", {}),
+                    (entry or {}).get("symbols", {}),
+                )
+                diff_str = format_diff_markdown(diff, rel_path)
+                if diff_str:
+                    ast_context = diff_str + "\n"
+                    print(f"  [step] AST diff detected")
+            elif entry:
+                summary = format_symbol_summary(entry)
+                if summary:
+                    ast_context = f"**Current symbols in `{rel_path}`:** {summary}\n"
+
+        except Exception as e:
+            print(f"  [step] ! AST context skipped: {e}")
+
+        task_with_ast = f"{task}\n\n{ast_context}" if ast_context else task
+
+        try:
+            candidates = await self._plan_actions(code, task_with_ast, k=k)
             print(f"  [step] generated {len(candidates)} candidates")
         except Exception as e:
             return {"error": f"Planning failed: {e}"}
@@ -266,6 +433,16 @@ class JEPAAgent:
 
         success = apply_patch(file_path, best_code)
 
+        # ── Update code index after patch ──
+        if success:
+            try:
+                lang = _ext_to_lang.get(os.path.splitext(file_path)[1].lower(), "python")
+                old_entry = await self._update_index_entry(file_path, language=lang)
+                if old_entry:
+                    print(f"  [step] updated code index for {os.path.basename(file_path)}")
+            except Exception as e:
+                print(f"  [step] ! index update skipped: {e}")
+
         try:
             vcontent = f"# JEPA Step {len(self.history) + 1}\n\n**Task:** {task}\n**File:** {file_path}\n**Selected:** candidate {best_idx}\n**JEPA Loss:** {best_loss:.4f}\n"
             await self._vault_write(f"lessons/step-{len(self.history) + 1}.md", vcontent, overwrite=True)
@@ -313,6 +490,16 @@ class JEPAAgent:
             self._project_root = root
             self._project_profile = existing
             self._onboarded = True
+            # Build index if missing or stale
+            try:
+                idx = await self._ensure_code_index()
+                if not idx.get("files"):
+                    exts = existing.get("all_extensions", [])
+                    if exts:
+                        scanned = await self._build_code_index(exts)
+                        print(f"  [onboard] indexed {scanned} source file(s)")
+            except (Exception, asyncio.CancelledError) as e:
+                print(f"  [onboard] ! index build skipped: {e}")
             return {"status": "loaded", "profile": existing}
 
         print(f"  [onboard] project root: {root}")
@@ -358,6 +545,15 @@ class JEPAAgent:
                             print(f"  [onboard] ! failed to install {lang}: {r}")
                     except Exception as e:
                         print(f"  [onboard] ! install error for {lang}: {e}")
+
+        # ── Build code index (tree-sitter AST cache) ──
+        try:
+            exts = profile.get("all_extensions", [])
+            if exts:
+                scanned = await self._build_code_index(exts)
+                print(f"  [onboard] indexed {scanned} source file(s)")
+        except (Exception, asyncio.CancelledError) as e:
+            print(f"  [onboard] ! code index build skipped: {e}")
 
         self._onboarded = True
         return {"status": "created", "profile": profile, "missing_parsers": missing}
