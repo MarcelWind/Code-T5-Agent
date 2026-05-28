@@ -106,8 +106,14 @@ def _extract_name(text: str, prefixes: list[str]) -> str:
     for p in prefixes:
         if p in text:
             after = text.split(p, 1)[1].strip()
-            return after.split("(")[0].split(":")[0].split()[0].strip()
-    return text.split("(")[0].split()[-1] if "(" in text else text[:40]
+            name = after.split("(")[0].split(":")[0].split()[0].strip()
+            if name and not name.startswith("..."):
+                return name
+    # Fallback: try to grab the first word before '(' or ':' that isn't a placeholder
+    candidate = text.split("(")[0].split()[-1] if "(" in text else text.strip()
+    if candidate and not candidate.startswith("..."):
+        return candidate
+    return ""
 
 
 def _extract_class_name(text: str) -> str:
@@ -115,8 +121,13 @@ def _extract_class_name(text: str) -> str:
     for keyword in ("class ", "struct ", "type "):
         if keyword in text:
             after = text.split(keyword, 1)[1].strip()
-            return after.split("(")[0].split(":")[0].split()[0].strip()
-    return text.split(":")[0].split()[-1] if ":" in text else text[:40]
+            name = after.split("(")[0].split(":")[0].split()[0].strip()
+            if name and not name.startswith("..."):
+                return name
+    candidate = text.split(":")[0].split()[-1] if ":" in text else text.strip()
+    if candidate and not candidate.startswith("..."):
+        return candidate
+    return ""
 
 
 def compute_diff(old_syms: dict, new_syms: dict) -> dict:

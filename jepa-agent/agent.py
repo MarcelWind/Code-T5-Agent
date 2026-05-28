@@ -34,7 +34,6 @@ from core.code_index import (
     get_index,
     save_index,
     needs_reparse,
-    extract_from_ast,
     compute_diff,
     format_diff_markdown,
     format_symbol_summary,
@@ -74,10 +73,22 @@ def _parse_tool_result(result) -> Any:
     combined = "\n".join(texts)
     if not combined:
         return {}
+    # First: try parsing the combined text as JSON (single object or array)
     try:
         return json.loads(combined)
     except (json.JSONDecodeError, TypeError):
-        return combined
+        pass
+    # Second: try parsing each text item individually and collect as a list
+    # (handles FastMCP returning one TextContent per list element)
+    if len(texts) > 1:
+        items = []
+        for t in texts:
+            try:
+                items.append(json.loads(t))
+            except (json.JSONDecodeError, TypeError):
+                items.append(t)
+        return items
+    return combined
 
 
 # ── MCP Connection Manager ──
@@ -253,10 +264,61 @@ class JEPAAgent:
             return None
         try:
             await self._ensure_server("code_understanding")
-            return await self._call("code_understanding", "parse_code", code=code, language=language, detail="overview")
+            return await self._call("code_understanding", "parse_code", code=code, language=language, detail="full")
         except (Exception, asyncio.CancelledError) as e:
             print(f"  [index] ! parse failed for {file_path}: {e}")
             return None
+
+    async def _get_file_symbols(self, file_path: str, language: str = "python") -> dict:
+        """Extract functions, classes, and imports using targeted tools (no 200-node cap).
+
+        Returns:
+            {"functions": [...], "classes": [...], "imports": [...]}
+        """
+        code = read_file(file_path)
+        if not code:
+            return {"functions": [], "classes": [], "imports": []}
+
+        await self._ensure_server("code_understanding")
+        symbols = {"functions": [], "classes": [], "imports": []}
+
+        try:
+            funcs = await self._call("code_understanding", "get_functions", code=code, language=language, include_body=False)
+            if isinstance(funcs, list):
+                for f in funcs:
+                    if isinstance(f, dict) and "name" in f:
+                        symbols["functions"].append({
+                            "name": f["name"],
+                            "line": f.get("start_line", 0),
+                            "end_line": f.get("end_line", 0),
+                        })
+        except (Exception, asyncio.CancelledError) as e:
+            print(f"  [index] ! get_functions failed: {e}")
+
+        try:
+            classes = await self._call("code_understanding", "get_classes", code=code, language=language)
+            if isinstance(classes, list):
+                for c in classes:
+                    if isinstance(c, dict) and "name" in c:
+                        symbols["classes"].append({
+                            "name": c["name"],
+                            "line": c.get("start_line", 0),
+                        })
+        except (Exception, asyncio.CancelledError) as e:
+            print(f"  [index] ! get_classes failed: {e}")
+
+        try:
+            imports = await self._call("code_understanding", "get_imports", code=code, language=language)
+            if isinstance(imports, list):
+                for imp in imports:
+                    if isinstance(imp, str):
+                        symbols["imports"].append(imp)
+                    elif isinstance(imp, dict):
+                        symbols["imports"].append(imp.get("statement", str(imp)))
+        except (Exception, asyncio.CancelledError) as e:
+            print(f"  [index] ! get_imports failed: {e}")
+
+        return symbols
 
     async def _update_index_entry(self, file_path: str, language: str = "python") -> dict | None:
         """Parse a file and update its entry in the index. Returns old entry if changed."""
@@ -267,18 +329,15 @@ class JEPAAgent:
         code = read_file(file_path)
         if not code:
             return old_entry
-        ast_data = await self._parse_ast(file_path, language)
-        if ast_data and not ast_data.get("error"):
-            syms = extract_from_ast(ast_data, source_code=code)
-            new_entry = {
-                "mtime": os.path.getmtime(file_path),
-                "language": ast_data.get("language", language),
-                "size": os.path.getsize(file_path),
-                "symbols": syms,
-            }
-            idx.setdefault("files", {})[rel_path] = new_entry
-            save_index(idx)
-            return old_entry
+        syms = await self._get_file_symbols(file_path, language)
+        new_entry = {
+            "mtime": os.path.getmtime(file_path),
+            "language": language,
+            "size": os.path.getsize(file_path),
+            "symbols": syms,
+        }
+        idx.setdefault("files", {})[rel_path] = new_entry
+        save_index(idx)
         return old_entry
 
     async def _build_code_index(self, extensions: list[str]) -> int:
@@ -310,17 +369,15 @@ class JEPAAgent:
                     file_code = read_file(full_path)
                     if not file_code:
                         continue
-                    ast_data = await self._parse_ast(full_path, language=lang)
-                    if ast_data and not ast_data.get("error"):
-                        syms = extract_from_ast(ast_data, source_code=file_code)
-                        idx = await self._ensure_code_index()
-                        idx.setdefault("files", {})[rel_path] = {
-                            "mtime": os.path.getmtime(full_path),
-                            "language": ast_data.get("language", lang),
-                            "size": os.path.getsize(full_path),
-                            "symbols": syms,
-                        }
-                        scanned += 1
+                    syms = await self._get_file_symbols(full_path, language=lang)
+                    idx = await self._ensure_code_index()
+                    idx.setdefault("files", {})[rel_path] = {
+                        "mtime": os.path.getmtime(full_path),
+                        "language": lang,
+                        "size": os.path.getsize(full_path),
+                        "symbols": syms,
+                    }
+                    scanned += 1
                 except (Exception, asyncio.CancelledError):
                     continue
 
@@ -490,14 +547,11 @@ class JEPAAgent:
             self._project_root = root
             self._project_profile = existing
             self._onboarded = True
-            # Build index if missing or stale
+            # Build index if missing
             try:
                 idx = await self._ensure_code_index()
                 if not idx.get("files"):
-                    exts = existing.get("all_extensions", [])
-                    if exts:
-                        scanned = await self._build_code_index(exts)
-                        print(f"  [onboard] indexed {scanned} source file(s)")
+                    await self.reindex()
             except (Exception, asyncio.CancelledError) as e:
                 print(f"  [onboard] ! index build skipped: {e}")
             return {"status": "loaded", "profile": existing}
@@ -548,15 +602,46 @@ class JEPAAgent:
 
         # ── Build code index (tree-sitter AST cache) ──
         try:
-            exts = profile.get("all_extensions", [])
-            if exts:
-                scanned = await self._build_code_index(exts)
-                print(f"  [onboard] indexed {scanned} source file(s)")
+            scanned = await self.reindex()
+            print(f"  [onboard] indexed {scanned} source file(s)")
         except (Exception, asyncio.CancelledError) as e:
             print(f"  [onboard] ! code index build skipped: {e}")
 
         self._onboarded = True
         return {"status": "created", "profile": profile, "missing_parsers": missing}
+
+    async def reindex(self, clear_first: bool = False) -> int:
+        """Rebuild the code index from scratch using the current project profile.
+
+        Call after onboard() to refresh the symbol index — useful when
+        files change or new extensions are added. Idempotent.
+
+        Args:
+            clear_first: If True, delete the existing index before rebuilding.
+
+        Returns:
+            Number of files indexed, or 0 if no project root/profile set.
+        """
+        if not self._project_root:
+            print("  [reindex] ! no project root — call onboard() first")
+            return 0
+        if not self._project_profile:
+            print("  [reindex] ! no project profile — call onboard() first")
+            return 0
+
+        if clear_first:
+            idx = await self._ensure_code_index()
+            idx.clear()
+            print("  [reindex] cleared existing index")
+
+        exts = self._project_profile.get("all_extensions", [])
+        if not exts:
+            print("  [reindex] ! no extensions in profile")
+            return 0
+
+        scanned = await self._build_code_index(exts)
+        print(f"  [reindex] indexed {scanned} source file(s)")
+        return scanned
 
     async def run(self, task: str, file_path: str, max_steps: int = MAX_STEPS) -> list[dict]:
         """Multi-step JEPA loop. Auto-runs onboard on first call if no profile."""

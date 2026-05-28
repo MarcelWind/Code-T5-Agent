@@ -34,6 +34,10 @@ CAPABILITIES = {
         "description": "JEPA scoring and code validation",
         "tools": ["validate_code", "rank_candidates", "validate_syntax", "batch_score"],
     },
+    "agent_tool": {
+        "description": "JEPA agent wrapper exposing onboard/step/run as MCP tools for external agent integration",
+        "tools": ["onboard_project", "step_agent", "run_agent_task", "get_agent_status", "reindex_code", "list_agent_tools"],
+    },
 }
 
 
@@ -93,6 +97,13 @@ def route_request(intent: str, payload: dict = None) -> dict:
             "reasoning": "Request involves validation or JEPA scoring.",
         }
 
+    if any(w in intent_lower for w in ["onboard", "step", "run agent", "jepa loop", "tool", "integrate"]):
+        return {
+            "target_server": "agent_tool",
+            "suggested_tool": _suggest_agent_tool(intent_lower),
+            "reasoning": "Request involves the JEPA agent pipeline or external integration.",
+        }
+
     return {
         "target_server": "local_router",
         "suggested_tool": "list_capabilities",
@@ -148,6 +159,20 @@ def _suggest_validator_tool(intent: str) -> str:
     if "score" in intent:
         return "batch_score"
     return "validate_code"
+
+
+def _suggest_agent_tool(intent: str) -> str:
+    if "onboard" in intent:
+        return "onboard_project"
+    if "reindex" in intent or "rebuild" in intent or "re-index" in intent:
+        return "reindex_code"
+    if "status" in intent or "state" in intent:
+        return "get_agent_status"
+    if "step" in intent:
+        return "step_agent"
+    if "list" in intent or "tool" in intent:
+        return "list_agent_tools"
+    return "run_agent_task"
 
 
 if __name__ == "__main__":
