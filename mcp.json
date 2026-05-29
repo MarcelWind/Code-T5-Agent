@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "jepa-agent": {
+      "command": "d:/Documents/Python/Code T5 Agent/.venv/Scripts/python.exe",
+      "args": ["-m", "mcp_servers.agent_tool.server"],
+      "cwd": "${workspaceFolder}/jepa-agent"
+    }
+  }
+}

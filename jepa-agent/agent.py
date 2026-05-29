@@ -20,8 +20,22 @@ import numpy as np
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
+# ── Load .env from project root (one level up from this file) ──
+import dotenv
+_dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+if os.path.isfile(_dotenv_path):
+    dotenv.load_dotenv(_dotenv_path)
+
 from core.executor import read_file, apply_patch, run_command
-from core.config import NUM_CANDIDATES, MAX_STEPS, JEPA_LOSS_TYPE
+from core.config import (
+    NUM_CANDIDATES,
+    MAX_STEPS,
+    JEPA_LOSS_TYPE,
+    CONTEXT_BUDGET_TOKENS,
+    CONTEXT_EXPANSION_HOPS,
+    CONTEXT_MAX_SEED_FILES,
+    CONTEXT_INCLUDE_MEMORY,
+)
 from core.onboarding import (
     detect_project_root,
     detect_project_languages,
@@ -33,12 +47,7 @@ from core.onboarding import (
 from core.code_index import (
     get_index,
     save_index,
-    needs_reparse,
-    compute_diff,
-    format_diff_markdown,
-    format_symbol_summary,
 )
-
 
 # ── Extension → tree-sitter language mapping ──
 _ext_to_lang = {
@@ -57,7 +66,6 @@ _ext_to_lang = {
     ".h": "c",
     ".hpp": "cpp",
 }
-
 
 # ── Helpers ──
 
@@ -89,7 +97,6 @@ def _parse_tool_result(result) -> Any:
                 items.append(t)
         return items
     return combined
-
 
 # ── MCP Connection Manager ──
 
@@ -124,19 +131,27 @@ SERVER_DEFS = {
         "args": [],
         "env": {"PYTHONPATH": ".", "HF_HOME": "models", "HF_HUB_CACHE": "models/hub"},
     },
+    "context_builder": {
+        "module": "mcp_servers.context_builder.server",
+        "args": [],
+        "env": {"PYTHONPATH": "."},
+    },
 }
 
+# ── Log helper: writes to stderr so MCP stdout transport stays clean ──
+_log = lambda *args, **kwargs: print(*args, file=sys.stderr, **kwargs)
 
 class MCPConnection:
     """A single stdio MCP server connection."""
 
-    def __init__(self, name: str, module: str, args: list[str] | None = None, env: dict | None = None):
+    def __init__(self, name: str, module: str, args: list[str] | None = None, env: dict | None = None, cwd: str | None = None):
         self.name = name
-        base_env = {**os.environ, **{"PYTHONIOENCODING": "utf-8"}, **(env or {})}
+        base_env = {**os.environ, **{"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}, **(env or {})}
         self.params = StdioServerParameters(
             command=sys.executable,
             args=["-m", module] + (args or []),
             env=base_env,
+            cwd=cwd,
         )
         self.session: ClientSession | None = None
         self._streams = None
@@ -152,7 +167,7 @@ class MCPConnection:
             await session.__aenter__()
             await session.initialize()
             self.session = session
-            print(f"  [mcp] connected -> {self.name}")
+            _log(f"  [mcp] connected -> {self.name}")
         except BaseException:
             # If connection fails mid-init, clean up any partial state
             if self.session:
@@ -183,10 +198,19 @@ class MCPConnection:
                 pass
             self._client_ctx = None
 
-    async def call(self, tool: str, **kwargs) -> Any:
+    async def call(self, tool: str, timeout: float = 120.0, **kwargs) -> Any:
         if not self.session:
             await self.connect()
-        result = await self.session.call_tool(tool, arguments=kwargs or None)
+        try:
+            result = await asyncio.wait_for(
+                self.session.call_tool(tool, arguments=kwargs or None),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"MCP call '{self.name}.{tool}()' timed out after {timeout}s. "
+                f"The sub-server may be stuck or unresponsive."
+            )
         return _parse_tool_result(result)
 
 
@@ -200,12 +224,14 @@ class JEPAAgent:
         self._project_profile: dict | None = None
         self._onboarded: bool = False
         self._code_index: dict | None = None
-        print("[JEPAAgent] MCP-orchestrated agent initialized")
+        _log("[JEPAAgent] MCP-orchestrated agent initialized")
 
     async def _ensure_server(self, name: str):
         if name not in self._servers:
             cfg = SERVER_DEFS[name]
-            conn = MCPConnection(name=name, module=cfg["module"], args=cfg.get("args", []), env=cfg.get("env"))
+            # Sub-servers need cwd = directory containing mcp_servers/ package
+            cwd = os.path.dirname(os.path.abspath(__file__))
+            conn = MCPConnection(name=name, module=cfg["module"], args=cfg.get("args", []), env=cfg.get("env"), cwd=cwd)
             try:
                 await conn.connect()
             except BaseException:
@@ -223,8 +249,11 @@ class JEPAAgent:
             return result["embedding"]
         raise ValueError(f"encode_code failed: {result}")
 
-    async def _plan_actions(self, code: str, task: str, k: int = 5) -> list[dict]:
-        result = await self._call("cloud_execution", "plan_actions", code_context=code, task=task, k=k)
+    async def _plan_actions(self, code: str, task: str, k: int = 5, context_package: str = "") -> list[dict]:
+        kwargs = {"code_context": code, "task": task, "k": k}
+        if context_package:
+            kwargs["context_package"] = context_package
+        result = await self._call("cloud_execution", "plan_actions", **kwargs)
         if isinstance(result, dict) and "candidates" in result:
             return result["candidates"]
         if isinstance(result, list):
@@ -249,6 +278,97 @@ class JEPAAgent:
     async def _vault_write(self, path: str, content: str, overwrite: bool = False) -> dict:
         return await self._call("obsidian_brain", "write_vault", path=path, content=content, overwrite=overwrite)
 
+    async def _vault_search(self, query: str) -> list[dict]:
+        """Search vault memory for context-relevant rules/patterns."""
+        try:
+            result = await self._call("obsidian_brain", "search_vault", query=query)
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict) and "_error" not in result:
+                return [result]
+            return []
+        except Exception:
+            return []
+
+    async def _semantic_search(self, query: str, top_k: int = 5) -> list[dict]:
+        """Search workspace via CodeT5+ semantic embedding."""
+        try:
+            result = await self._call(
+                "semantic_search", "search_code",
+                query=query,
+                workspace_path=self._project_root or "",
+                top_k=top_k,
+            )
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception:
+            return []
+
+    async def _build_execution_context(
+        self,
+        task: str,
+        file_path: str,
+    ) -> dict:
+        """Build a compressed execution neighborhood for the task.
+
+        Pipeline:
+          1. Semantic search → seed file matches
+          2. Vault search → relevant memory rules
+          3. Context builder → compressed package with budget enforcement
+
+        Returns:
+            dict with patch_targets, dependency_summaries, memory_rules,
+            excluded_files, estimated_tokens, expansion_stats.
+            Empty dict if context_builder server fails.
+        """
+        _log(f"  [ctx] building execution neighborhood for task...")
+
+        # Step 1: Semantic search for seed files
+        semantic_matches = await self._semantic_search(task, top_k=CONTEXT_MAX_SEED_FILES)
+        if semantic_matches:
+            _log(f"  [ctx] semantic search: {len(semantic_matches)} matches")
+            for m in semantic_matches[:3]:
+                fp = m.get("file", "") if isinstance(m, dict) else str(m)
+                sc = m.get("score", "") if isinstance(m, dict) else ""
+                _log(f"    - {fp} (score={sc})")
+        else:
+            _log(f"  [ctx] no semantic matches, using file imports as seeds")
+
+        # Step 2: Vault search for memory rules
+        memory_hits = []
+        if CONTEXT_INCLUDE_MEMORY:
+            memory_hits = await self._vault_search(task)
+            if memory_hits:
+                _log(f"  [ctx] vault memory: {len(memory_hits)} hits")
+
+        # Step 3: Call context_builder server
+        try:
+            code_index = await self._ensure_code_index()
+            result = await self._call(
+                "context_builder", "build_context",
+                task=task,
+                file_path=file_path,
+                semantic_matches=semantic_matches,
+                code_index=code_index,
+                project_root=self._project_root or "",
+                memory_hits=memory_hits,
+                token_budget=CONTEXT_BUDGET_TOKENS,
+                expansion_hops=CONTEXT_EXPANSION_HOPS,
+            )
+            if isinstance(result, dict) and "patch_targets" in result:
+                stats = result.get("expansion_stats", {})
+                _log(f"  [ctx] package: {stats.get('included', 0)} included, "
+                     f"{stats.get('excluded', 0)} excluded, "
+                     f"{stats.get('total_candidates', 0)} candidates, "
+                     f"~{result.get('estimated_tokens', 0)} tokens")
+                return result
+            _log(f"  [ctx] unexpected response: {type(result)}")
+            return {}
+        except Exception as e:
+            _log(f"  [ctx] ! context builder failed: {e}")
+            return {}
+
     # ── Code Index (tree-sitter AST cache) ──
 
     async def _ensure_code_index(self) -> dict:
@@ -266,7 +386,7 @@ class JEPAAgent:
             await self._ensure_server("code_understanding")
             return await self._call("code_understanding", "parse_code", code=code, language=language, detail="full")
         except (Exception, asyncio.CancelledError) as e:
-            print(f"  [index] ! parse failed for {file_path}: {e}")
+            _log(f"  [index] ! parse failed for {file_path}: {e}")
             return None
 
     async def _get_file_symbols(self, file_path: str, language: str = "python") -> dict:
@@ -293,7 +413,7 @@ class JEPAAgent:
                             "end_line": f.get("end_line", 0),
                         })
         except (Exception, asyncio.CancelledError) as e:
-            print(f"  [index] ! get_functions failed: {e}")
+            _log(f"  [index] ! get_functions failed: {e}")
 
         try:
             classes = await self._call("code_understanding", "get_classes", code=code, language=language)
@@ -305,7 +425,7 @@ class JEPAAgent:
                             "line": c.get("start_line", 0),
                         })
         except (Exception, asyncio.CancelledError) as e:
-            print(f"  [index] ! get_classes failed: {e}")
+            _log(f"  [index] ! get_classes failed: {e}")
 
         try:
             imports = await self._call("code_understanding", "get_imports", code=code, language=language)
@@ -316,7 +436,7 @@ class JEPAAgent:
                     elif isinstance(imp, dict):
                         symbols["imports"].append(imp.get("statement", str(imp)))
         except (Exception, asyncio.CancelledError) as e:
-            print(f"  [index] ! get_imports failed: {e}")
+            _log(f"  [index] ! get_imports failed: {e}")
 
         return symbols
 
@@ -392,41 +512,17 @@ class JEPAAgent:
 
         try:
             S_t = await self._encode(code)
-            print(f"  [step] encoded current state -> dim={len(S_t)}")
+            _log(f"  [step] encoded current state -> dim={len(S_t)}")
         except Exception as e:
             return {"error": f"Encoding failed: {e}"}
 
-        # ── AST context from tree-sitter index ──
-        ast_context = ""
-        try:
-            idx = await self._ensure_code_index()
-            rel_path = os.path.relpath(file_path, self._project_root) if self._project_root else file_path
-            entry = idx.get("files", {}).get(rel_path)
-
-            if needs_reparse(file_path, entry):
-                old_entry = await self._update_index_entry(file_path)
-                entry = idx.get("files", {}).get(rel_path)
-                diff = compute_diff(
-                    (old_entry or {}).get("symbols", {}),
-                    (entry or {}).get("symbols", {}),
-                )
-                diff_str = format_diff_markdown(diff, rel_path)
-                if diff_str:
-                    ast_context = diff_str + "\n"
-                    print(f"  [step] AST diff detected")
-            elif entry:
-                summary = format_symbol_summary(entry)
-                if summary:
-                    ast_context = f"**Current symbols in `{rel_path}`:** {summary}\n"
-
-        except Exception as e:
-            print(f"  [step] ! AST context skipped: {e}")
-
-        task_with_ast = f"{task}\n\n{ast_context}" if ast_context else task
+        # ── Build compressed execution neighborhood ──
+        context_package = await self._build_execution_context(task, file_path)
+        context_json = json.dumps(context_package) if context_package else ""
 
         try:
-            candidates = await self._plan_actions(code, task_with_ast, k=k)
-            print(f"  [step] generated {len(candidates)} candidates")
+            candidates = await self._plan_actions(code, task, k=k, context_package=context_json)
+            _log(f"  [step] generated {len(candidates)} candidates")
         except Exception as e:
             return {"error": f"Planning failed: {e}"}
 
@@ -461,7 +557,7 @@ class JEPAAgent:
                 orig_rankings.append(orig_idx)
             best_idx = orig_rankings[0] if orig_rankings else 0
         except Exception as e:
-            print(f"  [step] ranking server failed ({e}), scoring locally...")
+            _log(f"  [step] ranking server failed ({e}), scoring locally...")
             losses_local = []
             for si in scored_inputs:
                 loss = await self._score_pair(si["change_description"], si["expected_code"], JEPA_LOSS_TYPE)
@@ -478,15 +574,15 @@ class JEPAAgent:
         for i, cand in enumerate(candidates):
             desc = cand.get("description", "")[:50]
             loss_str = f" loss={losses[i]:.4f}" if i < len(losses) else ""
-            print(f"  [step]   candidate {i}: {desc}...{loss_str}")
+            _log(f"  [step]   candidate {i}: {desc}...{loss_str}")
 
         best_candidate = candidates[best_idx]
         best_code = best_candidate.get("expected_code", "")
-        print(f"  [step] selected candidate {best_idx} (loss={best_loss:.4f})")
+        _log(f"  [step] selected candidate {best_idx} (loss={best_loss:.4f})")
 
         syntax = await self._validate_syntax(best_code)
         if not syntax.get("valid", False):
-            print(f"  [step] ! best candidate has syntax errors")
+            _log(f"  [step] ! best candidate has syntax errors")
 
         success = apply_patch(file_path, best_code)
 
@@ -496,9 +592,9 @@ class JEPAAgent:
                 lang = _ext_to_lang.get(os.path.splitext(file_path)[1].lower(), "python")
                 old_entry = await self._update_index_entry(file_path, language=lang)
                 if old_entry:
-                    print(f"  [step] updated code index for {os.path.basename(file_path)}")
+                    _log(f"  [step] updated code index for {os.path.basename(file_path)}")
             except Exception as e:
-                print(f"  [step] ! index update skipped: {e}")
+                _log(f"  [step] ! index update skipped: {e}")
 
         try:
             vcontent = f"# JEPA Step {len(self.history) + 1}\n\n**Task:** {task}\n**File:** {file_path}\n**Selected:** candidate {best_idx}\n**JEPA Loss:** {best_loss:.4f}\n"
@@ -519,10 +615,10 @@ class JEPAAgent:
             _agent_dir = os.path.dirname(os.path.abspath(__file__))
             _stdout, _stderr, _ec = run_command(f'"{sys.executable}" -m pytest tests/ -q --tb=short', cwd=_agent_dir)
             if _ec == 0:
-                print(f"  [step] all tests passed after patch")
+                _log(f"  [step] all tests passed after patch")
             else:
-                print(f"  [step] ! tests FAILED (exit={_ec})")
-                print(f"  [step] ! {_stderr[:200]}")
+                _log(f"  [step] ! tests FAILED (exit={_ec})")
+                _log(f"  [step] ! {_stderr[:200]}")
             result["tests_exit"] = _ec
             result["tests_stderr"] = _stderr[:200] if _stderr else ""
 
@@ -534,16 +630,16 @@ class JEPAAgent:
 
         Idempotent — re-runs update the stored profile. Call before run() or standalone.
         """
-        print("  [onboard] detecting project root...")
+        _log("  [onboard] detecting project root...")
         root = detect_project_root(file_path)
         if not root:
-            print("  [onboard] ! could not determine project root")
+            _log("  [onboard] ! could not determine project root")
             return {"error": "No project root detected"}
 
         # Load existing profile
         existing = load_project_profile(root)
         if existing:
-            print(f"  [onboard] found existing profile for {existing.get('project_name', root)}")
+            _log(f"  [onboard] found existing profile for {existing.get('project_name', root)}")
             self._project_root = root
             self._project_profile = existing
             self._onboarded = True
@@ -553,12 +649,12 @@ class JEPAAgent:
                 if not idx.get("files"):
                     await self.reindex()
             except (Exception, asyncio.CancelledError) as e:
-                print(f"  [onboard] ! index build skipped: {e}")
+                _log(f"  [onboard] ! index build skipped: {e}")
             return {"status": "loaded", "profile": existing}
 
-        print(f"  [onboard] project root: {root}")
+        _log(f"  [onboard] project root: {root}")
         languages = detect_project_languages(root)
-        print(f"  [onboard] detected languages: {[l['language'] for l in languages]}")
+        _log(f"  [onboard] detected languages: {[l['language'] for l in languages]}")
 
         profile = generate_project_profile(root, languages)
         self._project_root = root
@@ -566,16 +662,16 @@ class JEPAAgent:
 
         # Save to .jepa-project.json
         save_project_profile(profile)
-        print(f"  [onboard] saved profile to {root}/.jepa-project.json")
+        _log(f"  [onboard] saved profile to {root}/.jepa-project.json")
 
         # Write to vault
         md = format_profile_markdown(profile)
         try:
             await self._ensure_server("obsidian_brain")
             await self._vault_write("rules/project-profile.md", md, overwrite=True)
-            print("  [onboard] wrote profile to vault: rules/project-profile.md")
+            _log("  [onboard] wrote profile to vault: rules/project-profile.md")
         except Exception as e:
-            print(f"  [onboard] ! vault write skipped: {e}")
+            _log(f"  [onboard] ! vault write skipped: {e}")
 
         # Check parsers for detected languages
         missing = []
@@ -587,25 +683,25 @@ class JEPAAgent:
                 missing.append(lang)
 
         if missing:
-            print(f"  [onboard] ! missing parsers: {', '.join(missing)}")
+            _log(f"  [onboard] ! missing parsers: {', '.join(missing)}")
             if install_parsers:
                 for lang in missing:
                     try:
                         await self._ensure_server("code_understanding")
                         r = await self._call("code_understanding", "install_language", language=lang)
                         if isinstance(r, dict) and r.get("success"):
-                            print(f"  [onboard] installed parser: {lang}")
+                            _log(f"  [onboard] installed parser: {lang}")
                         else:
-                            print(f"  [onboard] ! failed to install {lang}: {r}")
+                            _log(f"  [onboard] ! failed to install {lang}: {r}")
                     except Exception as e:
-                        print(f"  [onboard] ! install error for {lang}: {e}")
+                        _log(f"  [onboard] ! install error for {lang}: {e}")
 
         # ── Build code index (tree-sitter AST cache) ──
         try:
             scanned = await self.reindex()
-            print(f"  [onboard] indexed {scanned} source file(s)")
+            _log(f"  [onboard] indexed {scanned} source file(s)")
         except (Exception, asyncio.CancelledError) as e:
-            print(f"  [onboard] ! code index build skipped: {e}")
+            _log(f"  [onboard] ! code index build skipped: {e}")
 
         self._onboarded = True
         return {"status": "created", "profile": profile, "missing_parsers": missing}
@@ -623,24 +719,24 @@ class JEPAAgent:
             Number of files indexed, or 0 if no project root/profile set.
         """
         if not self._project_root:
-            print("  [reindex] ! no project root — call onboard() first")
+            _log("  [reindex] ! no project root — call onboard() first")
             return 0
         if not self._project_profile:
-            print("  [reindex] ! no project profile — call onboard() first")
+            _log("  [reindex] ! no project profile — call onboard() first")
             return 0
 
         if clear_first:
             idx = await self._ensure_code_index()
             idx.clear()
-            print("  [reindex] cleared existing index")
+            _log("  [reindex] cleared existing index")
 
         exts = self._project_profile.get("all_extensions", [])
         if not exts:
-            print("  [reindex] ! no extensions in profile")
+            _log("  [reindex] ! no extensions in profile")
             return 0
 
         scanned = await self._build_code_index(exts)
-        print(f"  [reindex] indexed {scanned} source file(s)")
+        _log(f"  [reindex] indexed {scanned} source file(s)")
         return scanned
 
     async def run(self, task: str, file_path: str, max_steps: int = MAX_STEPS) -> list[dict]:
@@ -648,18 +744,18 @@ class JEPAAgent:
         if not self._onboarded:
             onboard_result = await self.onboard(file_path)
             if onboard_result.get("error"):
-                print(f"  [onboard] warning: {onboard_result['error']}")
+                _log(f"  [onboard] warning: {onboard_result['error']}")
 
         results = []
         for step_num in range(1, max_steps + 1):
-            print(f"\n{'='*50}\n  JEPA Step {step_num}/{max_steps}\n{'='*50}")
+            _log(f"\n{'='*50}\n  JEPA Step {step_num}/{max_steps}\n{'='*50}")
             result = await self.step(task, file_path)
             results.append(result)
             if result.get("jepa_loss", 1.0) < 0.01:
-                print("[JEPAAgent] Converged (loss near zero).")
+                _log("[JEPAAgent] Converged (loss near zero).")
                 break
             if not result.get("success"):
-                print("[JEPAAgent] Step failed, stopping.")
+                _log("[JEPAAgent] Step failed, stopping.")
                 break
             task = f"Continue fixing. Previous attempt: {result.get('best_description', '')}"
         return results

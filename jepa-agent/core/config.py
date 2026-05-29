@@ -25,3 +25,9 @@ JEPA_TEMPERATURE = 0.07     # for contrastive loss
 NUM_CANDIDATES = 5
 MAX_STEPS = 5
 MAX_CODE_TOKENS = 512       # max tokens for CodeT5+ encoding
+
+# ── Context Builder ──
+CONTEXT_BUDGET_TOKENS = 4096   # max tokens for context package sent to LLM
+CONTEXT_EXPANSION_HOPS = 2     # max import hop depth for dependency expansion
+CONTEXT_MAX_SEED_FILES = 5     # max semantic search seeds to expand
+CONTEXT_INCLUDE_MEMORY = True  # include vault memory hits in context

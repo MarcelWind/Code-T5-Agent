@@ -26,7 +26,7 @@ class CodeEncoder:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = T5EncoderModel.from_pretrained(model_name).to(self.device)
         self.model.eval()
-        print(f"[CodeEncoder] loaded {model_name} on {self.device}")
+        print(f"[CodeEncoder] loaded {model_name} on {self.device}", file=__import__('sys').stderr)
 
     @torch.no_grad()
     def encode(self, code: str) -> np.ndarray:

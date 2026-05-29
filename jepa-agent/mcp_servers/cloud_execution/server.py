@@ -65,6 +65,26 @@ Each candidate MUST be a JSON object with:
 Return a JSON array of {k} candidates.
 """
 
+CONTEXT_AWARE_SYSTEM_PROMPT = """You are a JEPA-style coding agent predictor with execution-neighborhood context.
+
+You are given:
+1. The current source code (the file to patch)
+2. A task description
+3. A context package with dependency summaries, type information, and memory rules
+
+Use the context package to understand the project structure, but ONLY modify the
+provided source code file. Do not add dependencies that don't exist in the
+neighborhood. Respect the architectural constraints shown in the context.
+
+Propose {k} DISTINCT candidate patches as a JSON array.
+
+Each candidate MUST be a JSON object with:
+- "description": short explanation of the fix
+- "change_description": paragraph describing the SEMANTIC effect of the change
+- "expected_code": the COMPLETE code file AFTER applying this patch
+- "diff": concise description of what lines change
+"""
+
 
 @server.tool()
 def generate_code(prompt: str, system_prompt: str = None, temperature: float = 0.7) -> dict:
@@ -104,20 +124,45 @@ def generate_code(prompt: str, system_prompt: str = None, temperature: float = 0
 
 
 @server.tool()
-def plan_actions(code_context: str, task: str, k: int = 5) -> dict:
+def plan_actions(
+    code_context: str,
+    task: str,
+    k: int = 5,
+    context_package: Optional[str] = None,
+) -> dict:
     """Propose candidate patches via DeepSeek given current code + task.
 
     Args:
         code_context: Current source code.
         task: Description of the change to make.
         k: Number of candidates to generate (default: 5).
+        context_package: Optional JSON string from context_builder containing
+            compressed dependency summaries, type info, and memory rules.
+            When provided, the system prompt switches to context-aware mode.
 
     Returns:
         dict with 'candidates' (list of candidate dicts) and 'usage'.
     """
     client = _get_client()
 
-    user_prompt = f"""Task: {task}
+    if context_package:
+        user_prompt = f"""Task: {task}
+
+Current code (file to patch):
+```python
+{code_context}
+```
+
+Context package (dependency neighborhood):
+{context_package}
+
+Propose {k} distinct candidate patches as a JSON array. Stay within the
+dependencies shown in the context — do not introduce new imports unless
+absolutely necessary."""
+
+        system_prompt = CONTEXT_AWARE_SYSTEM_PROMPT.format(k=k)
+    else:
+        user_prompt = f"""Task: {task}
 
 Current code:
 ```python
@@ -126,10 +171,12 @@ Current code:
 
 Propose {k} distinct candidate patches as a JSON array."""
 
+        system_prompt = CANDIDATE_SYSTEM_PROMPT.format(k=k)
+
     resp = client.chat.completions.create(
         model=DEEPSEEK_MODEL,
         messages=[
-            {"role": "system", "content": CANDIDATE_SYSTEM_PROMPT.format(k=k)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         temperature=0.8,
