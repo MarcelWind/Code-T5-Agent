@@ -194,3 +194,33 @@ def format_symbol_summary(entry: dict) -> str:
     if imports:
         parts.append(f"{len(imports)} import(s)")
     return " | ".join(parts)
+
+
+def resolve_symbol(index: dict, rel_path: str, symbol_name: str) -> dict:
+    """Resolve a symbol name to its line range from the code index.
+
+    Args:
+        index: Full code index dict {'files': {...}}.
+        rel_path: Relative file path (e.g. 'agent.py').
+        symbol_name: Function or class name to look up.
+
+    Returns:
+        {'line': int (1-based), 'end_line': int (1-based inclusive)}.
+
+    Raises:
+        KeyError: If file or symbol not found in index.
+    """
+    entry = index.get("files", {}).get(rel_path)
+    if not entry:
+        raise KeyError(f"File '{rel_path}' not in code index")
+
+    syms = entry.get("symbols", {})
+    for kind in ("functions", "classes"):
+        for sym in syms.get(kind, []):
+            if sym.get("name") == symbol_name:
+                return {
+                    "line": sym["line"],
+                    "end_line": sym.get("end_line", sym["line"] + 1),
+                }
+
+    raise KeyError(f"Symbol '{symbol_name}' not found in '{rel_path}'")

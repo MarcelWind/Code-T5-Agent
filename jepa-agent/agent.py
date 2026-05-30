@@ -26,7 +26,7 @@ _dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.
 if os.path.isfile(_dotenv_path):
     dotenv.load_dotenv(_dotenv_path)
 
-from core.executor import read_file, apply_patch, run_command
+from core.executor import read_file, apply_patch, apply_patches, run_command
 from core.config import (
     NUM_CANDIDATES,
     MAX_STEPS,
@@ -529,16 +529,54 @@ class JEPAAgent:
         if not candidates:
             return {"error": "No candidates generated", "state_embedding": S_t}
 
+        # ── Build scored inputs (handle both patches[] and legacy expected_code) ──
         scored_inputs = []
         for cand in candidates:
             desc = cand.get("change_description", cand.get("description", ""))
+            patches = cand.get("patches")
             exp_code = cand.get("expected_code", "")
-            if desc and exp_code:
-                scored_inputs.append({"change_description": desc, "expected_code": exp_code, "description": cand.get("description", "")[:60]})
+            if desc and patches:
+                # Aggregate all new_body snippets for scoring
+                code_for_scoring = "\n\n".join(
+                    p.get("new_body", "") for p in patches if isinstance(p, dict)
+                )
+                if code_for_scoring:
+                    scored_inputs.append({
+                        "change_description": desc,
+                        "expected_code": code_for_scoring,
+                        "description": cand.get("description", "")[:60],
+                        "_has_patches": True,
+                        "_patches": patches,
+                    })
+            elif desc and exp_code:
+                scored_inputs.append({
+                    "change_description": desc,
+                    "expected_code": exp_code,
+                    "description": cand.get("description", "")[:60],
+                    "_has_patches": False,
+                })
 
         if not scored_inputs:
             for cand in candidates:
-                scored_inputs.append({"change_description": task, "expected_code": cand.get("expected_code", code), "description": cand.get("description", "")[:60]})
+                patches = cand.get("patches")
+                exp_code = cand.get("expected_code", "")
+                desc = cand.get("change_description", cand.get("description", ""))
+                if patches:
+                    code_str = "\n\n".join(p.get("new_body", "") for p in patches if isinstance(p, dict))
+                    scored_inputs.append({
+                        "change_description": desc or task,
+                        "expected_code": code_str or code,
+                        "description": cand.get("description", "")[:60],
+                        "_has_patches": True,
+                        "_patches": patches,
+                    })
+                else:
+                    scored_inputs.append({
+                        "change_description": desc or task,
+                        "expected_code": exp_code or code,
+                        "description": cand.get("description", "")[:60],
+                        "_has_patches": False,
+                    })
 
         try:
             ranking = await self._rank(scored_inputs, loss_type=JEPA_LOSS_TYPE)
@@ -577,37 +615,86 @@ class JEPAAgent:
             _log(f"  [step]   candidate {i}: {desc}...{loss_str}")
 
         best_candidate = candidates[best_idx]
-        best_code = best_candidate.get("expected_code", "")
+        best_si = scored_inputs[0]  # corresponds to best_idx via orig_rankings[0]
         _log(f"  [step] selected candidate {best_idx} (loss={best_loss:.4f})")
 
-        syntax = await self._validate_syntax(best_code)
-        if not syntax.get("valid", False):
-            _log(f"  [step] ! best candidate has syntax errors")
+        # ── Apply patches (symbol-diff) or fall back to full-file patch ──
+        changed_files: list[str] = []
+        syntax_valid = True
+        best_patches = best_candidate.get("patches")
+        if best_patches:
+            _log(f"  [step] applying {len(best_patches)} symbolic patches...")
+            success, changed_files = apply_patches(
+                best_patches,
+                await self._ensure_code_index(),
+                project_root=self._project_root or "",
+            )
+            if success:
+                _log(f"  [step] patched files: {changed_files}")
+                # Validate syntax of each changed file
+                for rel_path in changed_files:
+                    full = os.path.join(self._project_root or "", rel_path)
+                    patched_code = read_file(full)
+                    if patched_code:
+                        syn = await self._validate_syntax(patched_code)
+                        if not syn.get("valid", False):
+                            _log(f"  [step] ! syntax error in {rel_path}")
+                            syntax_valid = False
+            else:
+                _log(f"  [step] ! symbolic patch failed, falling back to full-file")
+                best_code = best_candidate.get("expected_code", "")
+                if best_code:
+                    success = apply_patch(file_path, best_code)
+                else:
+                    success = False
+        else:
+            # Legacy: single-file full replace
+            best_code = best_candidate.get("expected_code", "")
+            if best_code:
+                syntax = await self._validate_syntax(best_code)
+                syntax_valid = syntax.get("valid", False)
+                if not syntax_valid:
+                    _log(f"  [step] ! best candidate has syntax errors")
+                success = apply_patch(file_path, best_code)
+                changed_files = [os.path.relpath(file_path, self._project_root)] if self._project_root else [file_path]
+            else:
+                success = False
 
-        success = apply_patch(file_path, best_code)
-
-        # ── Update code index after patch ──
-        if success:
-            try:
-                lang = _ext_to_lang.get(os.path.splitext(file_path)[1].lower(), "python")
-                old_entry = await self._update_index_entry(file_path, language=lang)
-                if old_entry:
-                    _log(f"  [step] updated code index for {os.path.basename(file_path)}")
-            except Exception as e:
-                _log(f"  [step] ! index update skipped: {e}")
+        # ── Update code index for all changed files ──
+        if success and changed_files:
+            idx = await self._ensure_code_index()
+            for rel_path in changed_files:
+                full = os.path.join(self._project_root or "", rel_path)
+                if os.path.isfile(full):
+                    try:
+                        lang = _ext_to_lang.get(os.path.splitext(full)[1].lower(), "python")
+                        old_entry = await self._update_index_entry(full, language=lang)
+                        if old_entry:
+                            _log(f"  [step] updated code index for {rel_path}")
+                    except Exception as e:
+                        _log(f"  [step] ! index update skipped for {rel_path}: {e}")
 
         try:
-            vcontent = f"# JEPA Step {len(self.history) + 1}\n\n**Task:** {task}\n**File:** {file_path}\n**Selected:** candidate {best_idx}\n**JEPA Loss:** {best_loss:.4f}\n"
+            vcontent = (
+                f"# JEPA Step {len(self.history) + 1}\n\n"
+                f"**Task:** {task}\n"
+                f"**File:** {file_path}\n"
+                f"**Changed files:** {changed_files}\n"
+                f"**Selected:** candidate {best_idx}\n"
+                f"**JEPA Loss:** {best_loss:.4f}\n"
+            )
             await self._vault_write(f"lessons/step-{len(self.history) + 1}.md", vcontent, overwrite=True)
         except Exception:
             pass
 
         result = {
             "step": len(self.history) + 1, "task": task, "file": file_path,
+            "changed_files": changed_files,
             "best_idx": best_idx, "best_description": best_candidate.get("description", ""),
             "jepa_loss": float(best_loss), "all_losses": [float(l) for l in losses],
             "success": success, "num_candidates": len(candidates),
-            "syntax_valid": syntax.get("valid", False),
+            "syntax_valid": syntax_valid,
+            "patch_count": len(best_patches) if best_patches else 0,
         }
 
         # ── Run tests after patch ──

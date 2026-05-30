@@ -59,8 +59,16 @@ Given current code and a task, propose {k} DISTINCT candidate patches.
 Each candidate MUST be a JSON object with:
 - "description": short explanation of the fix
 - "change_description": paragraph describing the SEMANTIC effect of the change
-- "expected_code": the COMPLETE code file AFTER applying this patch
-- "diff": concise description of what lines change
+- "patches": array of patch objects, one per symbol modified:
+    {{"file": "relative/path/to/file.py",
+      "symbol": "function_or_class_name",
+      "new_body": "COMPLETE replacement body of the symbol (including def/class header)"}}
+- "diff": concise description of what changes
+
+IMPORTANT: Each function/class you modify gets its own patch entry.
+If you modify 3 symbols across 2 files, you output 3 patch entries.
+The symbol names and line ranges come from the context package you are given.
+Do NOT modify files or symbols not referenced in the task.
 
 Return a JSON array of {k} candidates.
 """
@@ -72,17 +80,30 @@ You are given:
 2. A task description
 3. A context package with dependency summaries, type information, and memory rules
 
-Use the context package to understand the project structure, but ONLY modify the
-provided source code file. Do not add dependencies that don't exist in the
-neighborhood. Respect the architectural constraints shown in the context.
+The context package shows relevant regions (compressed to matched functions + imports)
+and a full symbol index with line ranges for every file. Use these line ranges
+to target your patches precisely.
 
 Propose {k} DISTINCT candidate patches as a JSON array.
 
 Each candidate MUST be a JSON object with:
 - "description": short explanation of the fix
 - "change_description": paragraph describing the SEMANTIC effect of the change
-- "expected_code": the COMPLETE code file AFTER applying this patch
-- "diff": concise description of what lines change
+- "patches": array of patch objects, one per symbol modified:
+    {{"file": "relative/path/to/file.py",
+      "symbol": "function_or_class_name",
+      "new_body": "COMPLETE replacement body of the symbol (including def/class header)"}}
+- "diff": concise description of what changes
+
+IMPORTANT RULES:
+- Each function/class you modify gets its own patch entry.
+- Use the symbol names and line ranges from the context package.
+- Do NOT modify files or symbols not referenced in the task.
+- Do NOT add imports that don't exist in the neighborhood.
+- Respect the architectural constraints shown in the context.
+- If you need to add a new function, use symbol="<new_function_name>" and
+  include the full function definition in new_body. The executor will append
+  it after the last function in the file.
 """
 
 

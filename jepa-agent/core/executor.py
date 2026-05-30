@@ -2,6 +2,7 @@
 
 import subprocess
 import tempfile
+import os
 from pathlib import Path
 
 
@@ -61,3 +62,78 @@ class Workspace:
         full = self.root / file_path
         write_file(str(full), new_content)
         return new_content
+
+
+def apply_patches(
+    patches: list[dict],
+    code_index: dict,
+    project_root: str = "",
+) -> tuple[bool, list[str]]:
+    """Apply symbolic diffs across multiple files using code-index line ranges.
+
+    Each patch dict must have:
+      - 'file':  relative path (e.g. 'agent.py')
+      - 'symbol': function or class name to replace
+      - 'new_body': complete replacement body (including def/class header)
+
+    Patches targeting the same file are applied bottom-up so earlier
+    line offsets stay valid.  Falls back to full-file write if a patch
+    uses 'full_code' instead of 'symbol'.
+
+    Args:
+        patches: List of patch dicts.
+        code_index: Full code index dict for symbol resolution.
+        project_root: Absolute path to project root (prepended to file paths).
+
+    Returns:
+        (success, list_of_changed_relative_paths).
+    """
+    if not patches:
+        return True, []
+
+    # Import here to avoid circular dependency at module level
+    from core.code_index import resolve_symbol
+
+    changed: list[str] = []
+
+    # Group patches by file
+    by_file: dict[str, list[dict]] = {}
+    for p in patches:
+        by_file.setdefault(p["file"], []).append(p)
+
+    for rel_path, file_patches in by_file.items():
+        full_path = os.path.join(project_root, rel_path) if project_root else rel_path
+
+        # ── Check if any patch uses full_code (old format, do full replace) ──
+        full_code_patches = [p for p in file_patches if "full_code" in p]
+        if full_code_patches:
+            # Last full_code patch wins (convention matches old behavior)
+            write_file(full_path, full_code_patches[-1]["full_code"])
+            changed.append(rel_path)
+            continue
+
+        # ── Symbol-based line-range patches ──
+        lines = read_file(full_path)
+        if not lines:
+            return False, changed
+        lines_list = lines.splitlines(keepends=True)
+
+        resolved: list[tuple[int, int, str]] = []
+        for p in file_patches:
+            try:
+                loc = resolve_symbol(code_index, rel_path, p["symbol"])
+            except KeyError:
+                return False, changed
+            resolved.append((loc["line"], loc["end_line"], p["new_body"]))
+
+        # Sort bottom-up so line numbers of earlier patches stay valid
+        resolved.sort(key=lambda x: x[0], reverse=True)
+
+        for start_line, end_line, new_body in resolved:
+            # start_line/end_line are 1-based inclusive; Python slice is 0-based exclusive
+            lines_list[start_line - 1 : end_line] = [new_body.rstrip("\n") + "\n"]
+
+        write_file(full_path, "".join(lines_list))
+        changed.append(rel_path)
+
+    return True, changed
