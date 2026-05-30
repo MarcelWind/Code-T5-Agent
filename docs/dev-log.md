@@ -32,7 +32,7 @@
 
 ### Problems Still to Solve
 
-1. **New symbol insertion** — `apply_patches()` cannot add symbols that don't exist in the code index yet. `resolve_symbol()` raises `KeyError` for unknown names. The `patches[]` format supports `<new_function_name>` convention in prompts, but the executor has no handler for it — needs `--after` or `--at-end-of-file` directive.
+1. ✅ **New symbol insertion** — `apply_patches()` now handles `--after <existing_symbol>` (insert after named symbol) and `--at-end-of-file` (append at end) directives. Prompts updated to replace the vague `<new_function_name>` convention with these explicit directives. Handles mixed insertions + replacements via the existing bottom-up sort.
 
 2. **Multi-symbol single file edge case** — If two patches target the same function in the same file (e.g. rename + modify), the second patch will fail because the first already changed the line range. The bottom-up sort helps with *different* symbols at different lines, but doesn't help with overlapping ranges.
 

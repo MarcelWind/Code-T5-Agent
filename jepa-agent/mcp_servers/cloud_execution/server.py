@@ -70,6 +70,11 @@ If you modify 3 symbols across 2 files, you output 3 patch entries.
 The symbol names and line ranges come from the context package you are given.
 Do NOT modify files or symbols not referenced in the task.
 
+To ADD a new function or class (not in the code index yet), use one of:
+  - symbol="--after <existing_symbol>" — inserts after the named symbol
+  - symbol="--at-end-of-file"         — appends at the end of the file
+Set new_body to the COMPLETE definition (including def/class header).
+
 Return a JSON array of {k} candidates.
 """
 
@@ -101,9 +106,10 @@ IMPORTANT RULES:
 - Do NOT modify files or symbols not referenced in the task.
 - Do NOT add imports that don't exist in the neighborhood.
 - Respect the architectural constraints shown in the context.
-- If you need to add a new function, use symbol="<new_function_name>" and
-  include the full function definition in new_body. The executor will append
-  it after the last function in the file.
+- To ADD a new function or class, use:
+    symbol="--after existing_func_name"  — inserts after that symbol
+    symbol="--at-end-of-file"           — appends at end of file
+  Set new_body to the COMPLETE definition (def/class header included).
 """
 
 

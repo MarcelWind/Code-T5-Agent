@@ -41,8 +41,23 @@ Each candidate from `plan_actions()` now carries a `patches` array:
 
 Each patch object:
 - `file` — relative path from project root (e.g. `"agent.py"`, `"core/executor.py"`)
-- `symbol` — function or class name that exists in the code index
+- `symbol` — function or class name that exists in the code index; or an insertion directive (see below)
 - `new_body` — **complete replacement** for that symbol, including the `def`/`class` header
+
+### Adding New Symbols
+
+New symbols (not yet in the code index) use special directives in the `symbol`
+field instead of a symbol name:
+
+| Directive | Behavior |
+|---|---|
+| `"--after <existing_symbol>"` | Resolve the existing symbol's `end_line`, insert new body right after it |
+| `"--at-end-of-file"` | Append the new body at the very end of the file |
+
+Both directives handle the full function/class definition including the
+`def`/`class` header in `new_body`.  The bottom-up sort in `apply_patches()`
+handles mixed insertions and replacements correctly — insertions are no-op
+slices (`start > end`) that don't affect surrounding line offsets.
 
 ### Backward Compatibility
 

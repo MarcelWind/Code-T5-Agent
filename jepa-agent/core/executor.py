@@ -117,11 +117,31 @@ def apply_patches(
         if not lines:
             return False, changed
         lines_list = lines.splitlines(keepends=True)
+        file_len = len(lines_list)
 
         resolved: list[tuple[int, int, str]] = []
         for p in file_patches:
+            sym = p["symbol"]
+
+            # ── Insertion directives ──
+            if sym == "--at-end-of-file":
+                # Append at end: start = len+1, end = len → lines_list[len:len]
+                resolved.append((file_len + 1, file_len, p["new_body"]))
+                continue
+
+            if sym.startswith("--after "):
+                target = sym[len("--after "):]
+                try:
+                    loc = resolve_symbol(code_index, rel_path, target)
+                except KeyError:
+                    return False, changed
+                # Insert right after target's end_line
+                resolved.append((loc["end_line"] + 1, loc["end_line"], p["new_body"]))
+                continue
+
+            # ── Normal symbol replacement ──
             try:
-                loc = resolve_symbol(code_index, rel_path, p["symbol"])
+                loc = resolve_symbol(code_index, rel_path, sym)
             except KeyError:
                 return False, changed
             resolved.append((loc["line"], loc["end_line"], p["new_body"]))
