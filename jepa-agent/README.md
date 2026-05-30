@@ -38,9 +38,10 @@ A **self-bootstrapping** coding agent that uses a **JEPA** (Joint-Embedding Pred
 |---|---|---|
 | `code_understanding` | `parse_code`, `get_functions`, `get_classes`, `find_symbol`, `get_imports` | tree-sitter AST parsing (Python, JS, TS, Rust, Go, Java, Ruby, PHP, C, C++) |
 | `semantic_search` | `encode_code` | CodeT5+ (220M) 768-dim embeddings, FAISS vector search |
-| `cloud_execution` | `plan_actions` | DeepSeek Flash API — generates candidate patches |
+| `cloud_execution` | `plan_actions` | DeepSeek Flash API — generates candidate patches (`patches[]` format) |
 | `validators` | `validate_code`, `rank_candidates`, `validate_syntax` | JEPA loss computation, candidate ranking, syntax checks |
 | `obsidian_brain` | `write_vault`, `read_vault`, `search_vault` | Persistent markdown vault for lessons, patterns, decisions |
+| `context_builder` | `build_context` | Execution-neighborhood construction — compressed context from semantic matches + code index |
 | `local_router` | — | Intent routing (future: multi-tool dispatch) |
 
 ### Core Modules (`core/`)
@@ -51,25 +52,29 @@ A **self-bootstrapping** coding agent that uses a **JEPA** (Joint-Embedding Pred
 | `encoder.py` | `CodeEncoder` — wraps CodeT5+ for embedding extraction |
 | `predictor.py` | `DeepSeekPredictor` — LLM patch generation |
 | `scorer.py` | `jepa_loss`, `cosine_distance`, `l2_distance`, `rank_candidates` |
-| `executor.py` | `read_file`, `write_file`, `apply_patch`, `run_command`, `Workspace` |
+| `executor.py` | `read_file`, `write_file`, `apply_patch`, `apply_patches` (symbolic diffs), `run_command`, `Workspace` |
 | `onboarding.py` | Project root detection, language detection, profile generation |
-| `code_index.py` | Persistent tree-sitter AST cache (symbol manifest, diff computation) |
+| `code_index.py` | Persistent tree-sitter AST cache, `resolve_symbol()` for line-range lookups |
 
 ### Data Flow (JEPA Step)
 
 ```
 Observe ──→ Encode ──→ Predict ──→ Score ──→ Select ──→ Apply ──→ Test
   │            │           │           │          │          │        │
-  │      CodeT5+      DeepSeek     JEPA       lowest     patch     pytest
-  │      embedding    candidates   loss       loss       file      -q
-  │                                                              │
-  └───────────────────── loop until convergence ──────────────────┘
+  │      CodeT5+      DeepSeek     JEPA       lowest     symbolic   pytest
+  │      embedding    candidates   loss       loss       diffs      -q
+  │                         │                              via
+  │                    patches[]                        code index
+  │                   (multi-file)                      line ranges
+  └───────────────────── loop until convergence ───────────────────────┘
 ```
 
 Each step also:
-1. Loads the **tree-sitter code index** and prepends AST context (symbol diff) to the LLM prompt
-2. After patching, **updates the code index** with fresh AST data
-3. **Runs `pytest`** and records pass/fail in the step result
+1. Loads the **tree-sitter code index** and builds a compressed execution neighborhood via the `context_builder` MCP server
+2. Candidates are emitted as **`patches[]`** — symbolic diffs targeting specific functions/classes by name
+3. The executor resolves each patch via `resolve_symbol()` and applies **bottom-up line-range swaps**
+4. After patching, **updates the code index** for all changed files
+5. **Runs `pytest`** and records pass/fail in the step result
 
 ---
 
@@ -228,13 +233,13 @@ python main.py --task "refactor this" --file core/scorer.py -s 1 -k 10
 
 1. **Observe** — Read the target file
 2. **Encode** — Convert code → 768-dim embedding via CodeT5+
-3. **Context** — Load tree-sitter AST cache, compute symbol diff if file changed
-4. **Predict** — LLM generates `k` candidate patches with descriptions
-5. **Score** — Each candidate is scored by JEPA loss (cosine/L2 between predicted and actual code embeddings)
+3. **Context** — Build compressed execution neighborhood: semantic search → vault search → context_builder server (dependency expansion, role classification, budget enforcement)
+4. **Predict** — LLM generates `k` candidate patches as **`patches[]`** — each targeting a specific function/class by name, across any number of files
+5. **Score** — Each candidate is scored by JEPA loss (cosine/L2 between the `change_description` embedding and the concatenated patch bodies embedding)
 6. **Select** — Pick the lowest-loss candidate
-7. **Validate** — Syntax-check the patch
-8. **Apply** — Write the new code to the file
-9. **Index** — Refresh the tree-sitter AST cache entry
+7. **Validate** — Syntax-check each patched file
+8. **Apply** — Resolve each `{file, symbol}` via `resolve_symbol()` on the code index, perform **bottom-up line-range swaps** so earlier patches keep valid offsets
+9. **Index** — Refresh the tree-sitter AST cache entry for **every** changed file
 10. **Test** — Run `pytest` and record results
 11. **Repeat** — Feed the result back as context for the next step, stop when loss < 0.01 or max steps reached
 
@@ -252,8 +257,13 @@ The agent maintains a persistent symbol index at `vault/code-index/manifest.json
       "language": "python",
       "size": 24677,
       "symbols": {
-        "functions": ["read_file", "write_file", "apply_patch", "run_command"],
-        "classes": ["Workspace"],
+        "functions": [
+          {"name": "read_file", "line": 10, "end_line": 16},
+          {"name": "apply_patch", "line": 25, "end_line": 28},
+          {"name": "apply_patches", "line": 30, "end_line": 85},
+          {"name": "run_command", "line": 90, "end_line": 105}
+        ],
+        "classes": [{"name": "Workspace", "line": 110}],
         "imports": ["subprocess", "tempfile", "pathlib.Path"]
       }
     }
@@ -261,11 +271,14 @@ The agent maintains a persistent symbol index at `vault/code-index/manifest.json
 }
 ```
 
-- **On `step()`**: re-parses only if mtime changed, computes diff (added/removed/changed symbols), prepends it to the LLM task
+- **On `step()`**: loads the index into the `context_builder` server for dependency expansion and region extraction
 - **On `onboard()`**: builds the full index by walking source files
-- **After `apply_patch()`**: updates the entry for the modified file
+- **`resolve_symbol(index, rel_path, "function_name")`** → `{line, end_line}` — enables symbolic diffs by mapping symbol names to their current line ranges
+- **After patching**: refreshes the entry for **every** changed file
 
-This lets the agent know exactly what changed structurally between steps without re-parsing the entire codebase.
+This lets the agent resolve symbol names to line ranges for surgical patch
+application, and know exactly what changed structurally between steps without
+re-parsing the entire codebase.
 
 ---
 
@@ -303,14 +316,22 @@ pytest tests/ -q --tb=short
 
 ## Self-Bootstrapping
 
-The agent is designed to modify its **own source code**. In a successful end-to-end test, the agent:
+The agent is designed to modify its **own source code**. The pipeline supports
+multi-file refactoring via symbolic diffs: a single JEPA step can patch
+multiple functions across multiple agent source files simultaneously.
+
+In a successful end-to-end test, the agent:
 
 1. Detected its own project structure via onboarding
 2. Built a tree-sitter AST cache of all source files
 3. Modified `core/config.py` to add a version string
 4. Updated its own code index after the change
 
-This demonstrates the full JEPA loop operating on the agent's own codebase — a step toward autonomous self-improvement.
+More advanced bootstrapping (e.g. adding a new MCP server) works by emitting
+a `patches[]` array targeting different files in one step — the executor
+resolves them via the code index and applies bottom-up.
+
+See [`docs/patches-architecture.md`](../docs/patches-architecture.md) for details.
 
 ---
 
