@@ -182,11 +182,59 @@ def _classify_file(
     return "direct_dependency"  # Conservative: treat as dependency if reached
 
 
+def _find_relevant_regions(
+    patch_rel: str,
+    semantic_matches: Optional[list],
+    files_index: dict[str, dict],
+) -> list[dict]:
+    """Cross-reference semantic match lines against code_index function ranges.
+
+    Returns deduplicated list of function dicts (with 'name', 'line', 'end_line')
+    that enclose the matched chunk lines from semantic search.
+    Returns empty list if no relevant regions found.
+    """
+    if not semantic_matches:
+        return []
+
+    # Collect unique line numbers for the patch target file
+    patch_lines: set[int] = set()
+    for m in semantic_matches:
+        if isinstance(m, dict) and m.get("file") == patch_rel:
+            line = m.get("line")
+            if line is not None:
+                patch_lines.add(line)
+
+    if not patch_lines:
+        return []
+
+    # Get function definitions from code index
+    entry = files_index.get(patch_rel, {})
+    functions = entry.get("symbols", {}).get("functions", [])
+    if not functions:
+        return []
+
+    # For each match line, find enclosing function; dedup by (start, end)
+    seen: set[tuple[int, int]] = set()
+    regions: list[dict] = []
+    for line in patch_lines:
+        for fn in functions:
+            start = fn.get("line", 0)
+            end = fn.get("end_line", 0)
+            if end and start <= line <= end and (start, end) not in seen:
+                seen.add((start, end))
+                regions.append(fn)
+
+    # Sort by start line for deterministic output
+    regions.sort(key=lambda r: r.get("line", 0))
+    return regions
+
+
 def _compress_file(
     rel_path: str,
     role: str,
     entry: dict,
     code_content: str,
+    relevant_regions: Optional[list[dict]] = None,
 ) -> dict:
     """Compress a file entry into a summary or full representation.
 
@@ -219,9 +267,50 @@ def _compress_file(
     }
 
     if role == "patch_target":
-        # Full code allowed
-        summary["full_code"] = code_content
-        summary["size_chars"] = len(code_content)
+        if relevant_regions:
+            # Extract only relevant functions + imports via line slicing
+            lines = code_content.split("\n")
+            # Find where imports end (first non-import, non-blank, non-comment line)
+            import_end = 0
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("#", "from ", "import ")):
+                    import_end = i
+                    break
+            else:
+                import_end = len(lines)
+
+            # Collect line indices to keep (0-based)
+            keep: set[int] = set()
+            for i in range(import_end):
+                keep.add(i)
+            for region in relevant_regions:
+                start = region.get("line", 0) - 1   # convert 1-based → 0-based
+                end = region.get("end_line", 0)      # end_line is 1-based exclusive
+                for i in range(start, end):
+                    keep.add(i)
+
+            # Extract in source order, marking gaps
+            extracted_lines: list[str] = []
+            prev = -2
+            for i in sorted(keep):
+                if i < len(lines):
+                    if i > prev + 1:
+                        extracted_lines.append("# ... (context compressed)")
+                    extracted_lines.append(lines[i])
+                    prev = i
+
+            summary["relevant_code"] = "\n".join(extracted_lines)
+            summary["size_chars"] = len(summary["relevant_code"])
+            summary["compression_note"] = (
+                f"Extracted {len(relevant_regions)} region(s); "
+                f"full file has {len(lines)} lines, "
+                f"compressed to {len(extracted_lines)} lines"
+            )
+        else:
+            # Full code fallback
+            summary["full_code"] = code_content
+            summary["size_chars"] = len(code_content)
     elif role == "direct_dependency":
         # Summarized with key signatures
         summary["functions"] = [
@@ -412,6 +501,12 @@ def build_context(
     all_candidates = seed_files | hop1_set | hop2_set
     _log(f"  [ctx] seeds={len(seed_files)}, hop1={len(hop1_set)}, hop2={len(hop2_set)}, total={len(all_candidates)}")
 
+    # ── Step 2.5: Compute relevant regions for patch_target ──
+    target_regions = _find_relevant_regions(patch_rel, semantic_matches, files_index)
+    if target_regions:
+        names = [r.get("name", "?") for r in target_regions]
+        _log(f"  [ctx] relevant regions for {patch_rel}: {names}")
+
     # ── Step 3: File Role Classification ──
     summaries = []
     for rel_path in all_candidates:
@@ -428,7 +523,9 @@ def build_context(
             except (OSError, UnicodeDecodeError):
                 pass
 
-        summary = _compress_file(rel_path, role, entry, code_content)
+        # Pass relevant regions only for the patch target itself
+        regions_for_file = target_regions if rel_path == patch_rel else None
+        summary = _compress_file(rel_path, role, entry, code_content, regions_for_file)
         summaries.append(summary)
 
     # ── Step 4 & 5: Compress + Enforce Budget ──
