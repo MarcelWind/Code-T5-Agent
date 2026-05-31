@@ -40,7 +40,7 @@
 
 4. **Code index staleness** — If the file is edited externally (or by a previous failed step), the code index line ranges may be stale. `resolve_symbol()` returns whatever is in the manifest, even if the file on disk differs. Mtime checks during `step()` help but there's a race window.
 
-5. **Context builder test coverage** — The 6-stage pipeline has no unit tests yet. Integration tests rely on the full agent loop, which is slow and flaky. Need dedicated tests for each `_compress_file()` variant, `_find_relevant_regions()`, `_resolve_import_to_file()`, and budget enforcement logic.
+5. ✅ **Context builder test coverage** — The 6-stage pipeline has no unit tests yet. Integration tests rely on the full agent loop, which is slow and flaky. Need dedicated tests for each `_compress_file()` variant, `_find_relevant_regions()`, `_resolve_import_to_file()`, and budget enforcement logic.
 
 6. **Patch candidate quality** — DeepSeek sometimes emits `patches[]` with incorrect `symbol` names (typos, or guesses instead of exact names from context). The agent currently fails hard on `KeyError`. A fuzzy-match fallback (Levenshtein on symbol names) could reduce false failures.
 
